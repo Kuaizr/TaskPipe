@@ -2,37 +2,6 @@
 
 本文档介绍了基于 `Runnable`/`AsyncRunnable` 和 `WorkflowGraph` 的 Python 工作流框架的核心 API，支持同步和异步执行模式。
 
-## 异步支持
-
-### 关键特性
-
-- 所有操作均支持同步和异步模式
-- 使用 Python 原生 `asyncio` 实现
-- 支持异步上下文管理器和协程
-- 内置异步错误处理和重试机制
-
-### 使用方法
-
-```python
-from taskpipe import AsyncRunnable, AsyncContext
-
-class MyAsyncTask(AsyncRunnable):
-    async def _internal_invoke_async(self, input_data, context):
-        result = await some_async_operation()
-        return result
-
-async def main():
-    task = MyAsyncTask()
-    context = AsyncContext()
-    result = await task.invoke_async("input", context)
-```
-
-### 性能优化
-
-- 使用事件循环提高 I/O 密集型任务性能
-- 支持并发执行多个任务
-- 内存占用更小
-
 ## 目录结构
 
 ```
@@ -313,6 +282,38 @@ classDiagram
 
 *   `_internal_invoke(self, input_data: Any, context: ExecutionContext) -> Any`: 执行编译后的图。它会遍历排序后的节点，处理输入依赖（包括 `input_declaration` 和 `input_mapper`），并调用每个节点的 `invoke` 方法。
 *   `clear_cache(self, cache_name: str = 'all') -> 'CompiledGraph'`: 清除此编译图及其所有内部节点的缓存。
+
+
+## 异步支持
+
+### 关键特性
+
+- 所有操作均支持同步和异步模式
+- 使用 Python 原生 `asyncio` 实现
+- 支持异步上下文管理器和协程
+- 内置异步错误处理和重试机制
+
+### 使用方法
+
+```python
+from taskpipe import AsyncRunnable, AsyncContext
+
+class MyAsyncTask(AsyncRunnable):
+    async def _internal_invoke_async(self, input_data, context):
+        result = await some_async_operation()
+        return result
+
+async def main():
+    task = MyAsyncTask()
+    context = AsyncContext()
+    result = await task.invoke_async("input", context)
+```
+
+### 性能优化
+
+- 使用事件循环提高 I/O 密集型任务性能
+- 支持并发执行多个任务
+- 内存占用更小
 
 ## 快速入门 (Quick Start)
 

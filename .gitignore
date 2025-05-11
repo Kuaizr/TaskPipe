@@ -1,0 +1,52 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Distribution / packaging
+build/
+dist/
+*.egg-info/
+*.egg
+pip-wheel-metadata/
+develop-eggs/
+parts/
+sdist/
+var/
+wheels/
+*.tar.gz
+*.zip
+
+# Virtual environments
+.env
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# IDEs and editors
+.vscode/
+.idea/
+*.project
+*.pydevproject
+*.sublime-workspace
+*.sublime-project
+*.komodoproject
+*~
+*.bak
+*.swp
+
+# Test & Coverage artifacts
+.pytest_cache/
+pytestdebug.log
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+nosetests.xml
+
+# OS-specific
+.DS_Store
+Thumbs.db

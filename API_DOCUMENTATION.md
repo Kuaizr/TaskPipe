@@ -1,6 +1,37 @@
 # 工作流框架 API 文档
 
-本文档介绍了基于 `Runnable` 和 `WorkflowGraph` 的 Python 工作流框架的核心 API。
+本文档介绍了基于 `Runnable`/`AsyncRunnable` 和 `WorkflowGraph` 的 Python 工作流框架的核心 API，支持同步和异步执行模式。
+
+## 异步支持
+
+### 关键特性
+
+- 所有操作均支持同步和异步模式
+- 使用 Python 原生 `asyncio` 实现
+- 支持异步上下文管理器和协程
+- 内置异步错误处理和重试机制
+
+### 使用方法
+
+```python
+from taskpipe import AsyncRunnable, AsyncContext
+
+class MyAsyncTask(AsyncRunnable):
+    async def _internal_invoke_async(self, input_data, context):
+        result = await some_async_operation()
+        return result
+
+async def main():
+    task = MyAsyncTask()
+    context = AsyncContext()
+    result = await task.invoke_async("input", context)
+```
+
+### 性能优化
+
+- 使用事件循环提高 I/O 密集型任务性能
+- 支持并发执行多个任务
+- 内存占用更小
 
 ## 目录结构
 
@@ -9,7 +40,7 @@
 ├── core/
 │   ├── __init__.py
 │   ├── graph.py       # 包含 WorkflowGraph 和 CompiledGraph
-│   └── runnables.py   # 包含 Runnable 基类及其各种实现, ExecutionContext
+│   └── runnables.py   # 包含 Runnable/AsyncRunnable 基类及其各种实现, ExecutionContext
 ├── test_graph.py
 └── test_runnables.py
 ```
@@ -21,6 +52,34 @@ classDiagram
     direction LR
 
     class Runnable {
+        <<Abstract>>
+        +name: str
+        +input_declaration: Any
+        +_invoke_cache: Dict
+        +_check_cache: Dict
+        +_custom_check_fn: Optional[Callable]
+        +_error_handler: Optional[Runnable]
+        +_retry_config: Optional[Dict]
+        +_cache_key_generator: Callable
+        +invoke(input_data: Any, context: ExecutionContext) Any
+        +_internal_invoke(input_data: Any, context: ExecutionContext) Any
+        +check(data_from_invoke: Any, context: ExecutionContext) bool
+        +_default_check(data_from_invoke: Any) bool
+        +set_check(func: Callable) Runnable
+        +on_error(error_handler_runnable: Runnable) Runnable
+        +retry(max_attempts: int, delay_seconds: Union[int, float], retry_on_exceptions: Union[Type[Exception], Tuple]) Runnable
+        +clear_cache(cache_name: str) Runnable
+        +copy() Runnable
+    }
+
+    class AsyncRunnable {
+        <<Abstract>>
+        +invoke_async(input_data: Any, context: ExecutionContext) Coroutine[Any]
+        +check_async(data_from_invoke: Any, context: ExecutionContext) Coroutine[bool]
+        +_internal_invoke_async(input_data: Any, context: ExecutionContext) Coroutine[Any]
+        +_default_check_async(data_from_invoke: Any) Coroutine[bool]
+    }
+    Runnable <|-- AsyncRunnable
         <<Abstract>>
         +name: str
         +input_declaration: Any
@@ -139,7 +198,7 @@ classDiagram
 
 ## 核心 API
 
-### 1. `core.runnables.ExecutionContext`
+### 1. `core.runnables.ExecutionContext` (同步/异步)
 
 此类用于在工作流执行期间携带状态和节点输出。
 
@@ -161,7 +220,7 @@ classDiagram
 
 *   `NO_INPUT`: 一个哨兵对象，标记 `Runnable` 没有接收到直接输入，应尝试从上下文获取。
 
-### 2. `core.runnables.Runnable` (ABC)
+### 2. `core.runnables.Runnable` (ABC) 和 `AsyncRunnable`
 
 所有可执行单元的抽象基类。
 
@@ -192,7 +251,9 @@ classDiagram
 *   `__or__` (`|`): 用于链接 `Runnable` (创建 `Pipeline` 或 `BranchAndFanIn`)。
 *   `__mod__` (`%`), `__rshift__` (`>>`): 用于创建 `Conditional` `Runnable`。
 
-### 3. `core.runnables` 中的具体 `Runnable` 实现
+### 3. `core.runnables` 中的具体实现
+
+#### 同步实现
 
 *   **`SimpleTask(Runnable)`**: 将普通函数包装成 `Runnable`。
     *   `__init__(self, func: Callable, name: Optional[str] = None, input_declaration: Any = None, **kwargs)`
@@ -209,7 +270,12 @@ classDiagram
 *   **`MergeInputs(Runnable)`**: 从上下文收集多个输入，并传递给一个合并函数。
     *   `__init__(self, input_sources: Dict[str, str], merge_function: Callable[..., Any], name: Optional[str] = None, **kwargs)`
 
-### 4. `core.graph.WorkflowGraph`
+#### 异步实现
+
+* **`AsyncBranchAndFanIn`**: 异步分支合并实现
+* **`AsyncSourceParallel`**: 异步并行源实现
+
+### 4. `core.graph.WorkflowGraph` (同步/异步)
 
 用于构建工作流图的构建器类。
 

@@ -1,4 +1,4 @@
-from core.runnables import SimpleTask, ExecutionContext, Runnable, NO_INPUT
+from taskpipe.runnables import SimpleTask, ExecutionContext, Runnable, NO_INPUT
 
 
 def two() -> int:
@@ -46,7 +46,7 @@ ctx2 = ExecutionContext()
 result2 = work2.invoke(NO_INPUT, ctx2)
 print(f"Result for 13: {result2}")
 # --- 新增测试：合并 work1 和 work2 的输出 ---
-from core.runnables import SourceParallel
+from taskpipe.runnables import SourceParallel
 
 def add_all_results(**results_kwargs: str) -> str:
     """

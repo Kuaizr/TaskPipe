@@ -3,8 +3,8 @@ import logging
 from unittest.mock import MagicMock, ANY
 
 # Assuming runnables.py and graph.py are accessible
-from core.runnables import Runnable, SimpleTask, ExecutionContext, NO_INPUT, MergeInputs
-from core.graph import WorkflowGraph, CompiledGraph
+from taskpipe.runnables import Runnable, SimpleTask, ExecutionContext, NO_INPUT, MergeInputs
+from taskpipe.graph import WorkflowGraph, CompiledGraph
 
 # Suppress most logging output during tests
 # Configure specific loggers if needed for debugging

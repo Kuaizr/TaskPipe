@@ -5,7 +5,7 @@ from unittest.mock import MagicMock, call, patch
 from typing import Any, Callable, Optional, Dict, List, Tuple, Union, Type # Import Any and other types
 
 # Assuming runnables.py is in the same directory or accessible via PYTHONPATH
-from core.runnables import (
+from taskpipe.runnables import (
     ExecutionContext,
     Runnable,
     SimpleTask,

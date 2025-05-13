@@ -5,7 +5,7 @@ import logging
 from unittest.mock import MagicMock, call
 
 from taskpipe.runnables import Runnable, SimpleTask, ExecutionContext, NO_INPUT, Pipeline as SyncPipeline
-from taskpipe.async_runnables import (
+from taskpipe import (
     AsyncRunnable, 
     AsyncPipeline, 
     AsyncConditional, 
@@ -14,6 +14,8 @@ from taskpipe.async_runnables import (
     AsyncSourceParallel,
     _AsyncPendingConditional # For testing operator if needed
 )
+
+
 
 # Configure logger for less verbose test output
 logging.getLogger('taskpipe.runnables').setLevel(logging.CRITICAL)

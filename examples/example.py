@@ -1,4 +1,4 @@
-from taskpipe.runnables import SimpleTask, ExecutionContext, Runnable, NO_INPUT
+from taskpipe import SimpleTask, ExecutionContext, Runnable, NO_INPUT
 
 
 def two() -> int:

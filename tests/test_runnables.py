@@ -5,19 +5,18 @@ import asyncio # Added for testing invoke_async
 from unittest.mock import MagicMock, call, patch
 from typing import Any, Callable, Optional, Dict, List, Tuple, Union, Type, Coroutine # Added Coroutine
 
-# Assuming runnables.py is in the same directory or accessible via PYTHONPATH
-from taskpipe.runnables import (
+from taskpipe import ( 
     ExecutionContext,
     Runnable,
     SimpleTask,
     Pipeline,
-    Conditional,
-    BranchAndFanIn,
-    SourceParallel,
-    While,
-    MergeInputs,
     NO_INPUT,
-    _PendingConditional
+    AsyncRunnable,
+    AsyncPipeline,
+    While,
+    SourceParallel,
+    BranchAndFanIn,
+    MergeInputs
 )
 # Import an AsyncRunnable for mixed tests
 from taskpipe.async_runnables import AsyncRunnable, AsyncPipeline, AsyncConditional

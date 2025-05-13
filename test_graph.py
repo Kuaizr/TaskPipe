@@ -201,10 +201,14 @@ class TestCompiledGraph(unittest.TestCase):
         node_fail = GraphTestMockRunnable(name="FAIL", invoke_side_effect=RuntimeError("NodeFailed"))
         graph.add_node(node_ok); graph.add_node(node_fail)
         graph.add_edge("OK", "FAIL")
-        
+    
         compiled_graph = graph.compile()
-        with self.assertRaisesRegex(RuntimeError, "NodeFailed"):
+        try:
             compiled_graph.invoke("start")
+        except RuntimeError as e:
+            self.assertEqual(str(e), "NodeFailed")
+        else:
+            self.fail("RuntimeError not raised")
 
     def test_compiled_graph_caching(self):
         graph = WorkflowGraph(name="CacheTestG")
@@ -270,11 +274,11 @@ class TestCompiledGraph(unittest.TestCase):
         
         # Set graph_logger level to WARNING to catch the specific log message
         # Use the updated logger name for 'core.graph'
-        logger_to_check = logging.getLogger('core.graph')
+        logger_to_check = logging.getLogger('taskpipe.graph')
         original_level = logger_to_check.level
         logger_to_check.setLevel(logging.WARNING)
         try:
-            with self.assertLogs(logger='core.graph', level='WARNING') as cm:
+            with self.assertLogs(logger='taskpipe.graph', level='WARNING') as cm:
                  result = compiled_graph.invoke("start_input")
             self.assertTrue(any("Node 'C'" in log_msg and "multiple incoming edges but no input_declaration" in log_msg for log_msg in cm.output))
         finally:

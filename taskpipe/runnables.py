@@ -3,7 +3,8 @@ import time
 import logging
 import hashlib
 import pickle
-from typing import Any, Callable, Optional, Dict, List, Tuple, Union, Type
+import asyncio # Added for invoke_async
+from typing import Any, Callable, Optional, Dict, List, Tuple, Union, Type, Coroutine
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # 用于标记没有显式输入的情况
@@ -122,7 +123,9 @@ class Runnable(abc.ABC):
 
         self._invoke_cache: Dict[Any, Any] = {}
         self._check_cache: Dict[Any, bool] = {}
-        self._custom_check_fn: Optional[Callable[[Any], bool]] = None
+        self._custom_check_fn: Optional[Callable[[Any], bool]] = None # Sync custom check
+        self._custom_async_check_fn: Optional[Callable[[Any], Coroutine[Any, Any, bool]]] = None # Async custom check
+
         self._error_handler: Optional['Runnable'] = None
         self._retry_config: Optional[Dict[str, Any]] = None
         self.input_declaration: Any = input_declaration
@@ -136,175 +139,179 @@ class Runnable(abc.ABC):
         effective_context = context if context is not None else ExecutionContext(initial_input=input_data if input_data is not NO_INPUT else None)
         # logger.debug(f"DEBUG: Runnable '{self.name}' using effective_context ID: {id(effective_context)}") # Debug print
         
-        # Determine the actual input data for _internal_invoke and cache key generation
         actual_input_for_invoke = input_data
         if self.input_declaration and input_data is NO_INPUT and effective_context:
             if isinstance(self.input_declaration, str):
                 actual_input_for_invoke = effective_context.get_output(self.input_declaration)
-                # logger.debug(f"Runnable '{self.name}': Fetched input '{self.input_declaration}' from context: {str(actual_input_for_invoke)[:60]}...")
             elif isinstance(self.input_declaration, dict):
                 kwargs_from_context = {}
                 for param_name, source_key in self.input_declaration.items():
-                    if isinstance(source_key, str): # Ensure source_key is a string for context lookup
+                    if isinstance(source_key, str): 
                         kwargs_from_context[param_name] = effective_context.get_output(source_key)
                     else:
-                         # Handle cases where source_key might be a literal value or other type
-                         kwargs_from_context[param_name] = source_key # Use the source_key directly
-                         # logger.warning(f"Runnable '{self.name}': input_declaration source key for '{param_name}' is not a string ('{source_key}'). Using value directly.")
-
+                         kwargs_from_context[param_name] = source_key
                 actual_input_for_invoke = kwargs_from_context
-                # logger.debug(f"Runnable '{self.name}': Fetched inputs from context based on declaration: {list(kwargs_from_context.keys())}")
-            elif callable(self.input_declaration): # If input_declaration is a function
+            elif callable(self.input_declaration): 
                 actual_input_for_invoke = self.input_declaration(effective_context)
-                # logger.debug(f"Runnable '{self.name}': Fetched input from context using a custom function.")
-            # else: input_declaration is some other type, actual_input_for_invoke remains NO_INPUT or original input_data
 
         cache_key = self._get_cache_key(actual_input_for_invoke, effective_context)
 
         if cache_key in self._invoke_cache:
-            # logger.info(f"Runnable '{self.name}': Using cached invoke result for key '{str(cache_key)[:60]}'.")
             effective_context.log_event(f"Node '{self.name}': Invoke result from cache.")
             result = self._invoke_cache[cache_key]
-            # Even if cached, add to context for downstream nodes in the current run
-            if self.name and effective_context: # Ensure context exists
+            if self.name and effective_context: 
                 effective_context.add_output(self.name, result)
-            
             return result
 
         current_attempt = 0
         max_attempts = (self._retry_config or {}).get("max_attempts", 1)
         delay_seconds = (self._retry_config or {}).get("delay_seconds", 0)
-        retry_on_exceptions = (self._retry_config or {}).get("retry_on_exceptions", (Exception,)) # Default to retry on all exceptions
+        retry_on_exceptions = (self._retry_config or {}).get("retry_on_exceptions", (Exception,)) 
 
         while current_attempt < max_attempts:
             current_attempt += 1
-            # logger.debug(f"Runnable '{self.name}': Attempt {current_attempt}/{max_attempts}. Input type: {type(actual_input_for_invoke).__name__}")
             effective_context.log_event(f"Node '{self.name}': Invoking (Attempt {current_attempt}/{max_attempts}). Input type: {type(actual_input_for_invoke).__name__}")
 
             try:
                 result = self._internal_invoke(actual_input_for_invoke, effective_context)
                 
                 self._invoke_cache[cache_key] = result
-                # logger.info(f"Runnable '{self.name}': Invoked successfully. Output type: {type(result).__name__}. Output: {str(result)[:60]}...")
                 effective_context.log_event(f"Node '{self.name}': Invoked successfully. Output type: {type(result).__name__}.")
 
-                # Always add output to context if the node has a name
                 if self.name:
                     effective_context.add_output(self.name, result)
                 
                 return result
 
             except Exception as e:
-                # logger.error(f"Runnable '{self.name}': Error during invoke (Attempt {current_attempt}/{max_attempts}): {type(e).__name__}: {e}", exc_info=logger.level <= logging.DEBUG)
                 effective_context.log_event(f"Node '{self.name}': Error during invoke (Attempt {current_attempt}/{max_attempts}): {type(e).__name__}: {e}")
 
                 is_retryable = isinstance(e, retry_on_exceptions)
                 is_last_attempt = (current_attempt == max_attempts)
 
                 if not is_retryable or is_last_attempt:
-                    # If not retryable, or it's the last attempt and still failed
                     if self._error_handler:
-                        # logger.info(f"Runnable '{self.name}': Error handler '{self._error_handler.name}' is defined. Invoking error handler.")
                         effective_context.log_event(f"Node '{self.name}': Invoking error handler '{self._error_handler.name}'.")
                         try:
-                            # Error handler receives the input that caused the failure and the context
                             error_handler_output = self._error_handler.invoke(actual_input_for_invoke, effective_context)
-                            # logger.info(f"Runnable '{self.name}': Error handler '{self._error_handler.name}' executed. Output type: {type(error_handler_output).__name__}. Output: {str(error_handler_output)[:60]}...")
                             effective_context.log_event(f"Node '{self.name}': Error handler '{self._error_handler.name}' executed.")
-                            # Add error handler's output to context under the original node's name
                             if self.name:
                                 effective_context.add_output(self.name, error_handler_output)
-                            self._invoke_cache[cache_key] = error_handler_output # Cache error handler's result
-                            return error_handler_output # Return error handler's output as this node's result
+                            self._invoke_cache[cache_key] = error_handler_output 
+                            return error_handler_output 
                         except Exception as eh_e:
-                            # logger.error(f"Runnable '{self.name}': Error handler '{self._error_handler.name}' also failed: {type(eh_e).__name__}: {eh_e}", exc_info=logger.level <= logging.DEBUG)
                             effective_context.log_event(f"Node '{self.name}': Error handler '{self._error_handler.name}' also failed: {type(eh_e).__name__}: {eh_e}")
-                            # If error handler fails, re-raise the original exception (or the handler's exception?)
-                            # Re-raising the original exception seems more predictable for upstream error handling
-                            raise e from eh_e # Chain the exceptions
+                            raise e from eh_e 
 
                     else:
-                        # No error handler and no more retries or not retryable
-                        # Before raising, let's see the context state
-                        # logger.debug(f"DEBUG_INVOKE_EXIT (RAISE): Runnable '{self.name}' (id: {id(self)}) PRE-RAISE. EFFECTIVE_CONTEXT ({id(effective_context)}) outputs: {list(effective_context.node_outputs.keys())}")
-                        raise e # Re-raise the original exception
+                        raise e 
             
-            # If retryable and not last attempt
-            # logger.info(f"Runnable '{self.name}': Retrying in {delay_seconds} seconds...")
                 effective_context.log_event(f"Node '{self.name}': Retrying in {delay_seconds} seconds.")
                 time.sleep(delay_seconds)
         
-        # This part should ideally not be reached if max_attempts >= 1 and exceptions are handled/retried
-        # If we reach here, it means the loop finished without returning or raising, which is unexpected.
-        # Re-raising the last error is a safe fallback.
-        # The last error 'e' is still available here due to Python's exception handling scope.
-        try:
-            # Check if 'e' was defined in the last except block
-            _ = e
-            raise e # Re-raise the last exception
-        except NameError:
-             # Should not happen if max_attempts > 0 and loop was entered
-             raise RuntimeError(f"Runnable '{self.name}': Unexpected exit from retry loop.")
+        # Should not be reached if max_attempts >=1
+        # Re-raise the last exception if loop finishes without returning
+        if 'e' in locals(): # Check if exception 'e' was defined
+            raise e
+        else: # Should ideally not happen if loop was entered
+            raise RuntimeError(f"Runnable '{self.name}': Exited retry loop unexpectedly without an exception or return.")
 
 
     @abc.abstractmethod
     def _internal_invoke(self, input_data: Any, context: ExecutionContext) -> Any:
         pass
 
+    async def invoke_async(self, input_data: Any = NO_INPUT, context: Optional[ExecutionContext] = None) -> Any:
+        """
+        Default asynchronous invocation for a Runnable.
+        Runs the synchronous invoke method in a thread pool executor.
+        Subclasses (like AsyncRunnable) should override this for native async behavior.
+        """
+        # logger.debug(f"Runnable '{self.name}': Default invoke_async, running sync invoke in executor.")
+        loop = asyncio.get_event_loop()
+        # The synchronous self.invoke already handles context creation, input declaration,
+        # caching, retries, and error handling.
+        return await loop.run_in_executor(None, self.invoke, input_data, context)
+
     def check(self, data_from_invoke: Any, context: Optional[ExecutionContext] = None) -> bool:
-        # Check cache key should ideally also consider context if check function uses it.
-        # For simplicity, using data_from_invoke directly as key for now.
-        # A more robust key would be similar to _get_cache_key.
         cache_key_data = data_from_invoke
         try:
-            # Attempt to make it more robust by pickling
             cache_key = pickle.dumps(cache_key_data)
         except Exception:
-            cache_key = object() # Fallback if not picklable
+            cache_key = object() 
 
         if cache_key in self._check_cache:
-            # logger.debug(f"Runnable '{self.name}': Using cached check result for key '{str(cache_key)[:60]}'.")
             if context: context.log_event(f"Node '{self.name}': Check result from cache.")
             return self._check_cache[cache_key]
 
         if self._custom_check_fn:
-            # logger.debug(f"Runnable '{self.name}': Using custom check function.")
             result = self._custom_check_fn(data_from_invoke)
         else:
-            # logger.debug(f"Runnable '{self.name}': Using default check function.")
             result = self._default_check(data_from_invoke)
 
         self._check_cache[cache_key] = result
-        # logger.debug(f"Runnable '{self.name}': Check result: {result}.")
         if context: context.log_event(f"Node '{self.name}': Check result: {result}.")
         return result
 
     def _default_check(self, data_from_invoke: Any) -> bool:
+        return bool(data_from_invoke)
+
+    async def check_async(self, data_from_invoke: Any, context: Optional[ExecutionContext] = None) -> bool:
         """
-        默认的检查逻辑，通常是基于真值测试。
-        MockRunnable 的 _check_side_effect 逻辑不应在此处。
+        Default asynchronous check for a Runnable.
+        Runs the synchronous check method in a thread pool executor.
+        Subclasses (like AsyncRunnable) should override this for native async behavior.
+        """
+        # logger.debug(f"Runnable '{self.name}': Default check_async, running sync check in executor.")
+        
+        # Async custom check function takes precedence if available
+        if self._custom_async_check_fn:
+            # logger.debug(f"Runnable '{self.name}': Using async custom check function for check_async.")
+            # Logic for caching async check results would be needed here if we don't go through sync `check`
+            # For simplicity now, let's assume custom_async_check_fn bypasses the standard cache, or handles its own.
+            # Or, we can try to integrate it with the existing _check_cache if keys are compatible.
+            # This default implementation below prioritizes the sync path if no _custom_async_check_fn exists.
+            return await self._custom_async_check_fn(data_from_invoke)
+
+        # Fallback to running the synchronous check method in an executor
+        loop = asyncio.get_event_loop()
+        # The synchronous self.check already handles caching logic.
+        return await loop.run_in_executor(None, self.check, data_from_invoke, context)
+
+    async def _default_check_async(self, data_from_invoke: Any) -> bool:
+        """
+        Default asynchronous check logic. AsyncRunnables will override this.
+        For base Runnable, it's essentially bool(data).
         """
         return bool(data_from_invoke)
 
-    def set_check(self, func: Callable[[Any], bool]):
-        """允许用户自定义 check 方法的逻辑。"""
-        if not callable(func):
-             raise TypeError("Custom check function must be callable.")
-        self._custom_check_fn = func
-        self.clear_cache('_check_cache') # 自定义检查函数改变，应清除检查缓存
-        # logger.debug(f"Runnable '{self.name}': Custom check function set.")
+
+    def set_check(self, func: Union[Callable[[Any], bool], Callable[[Any], Coroutine[Any, Any, bool]]]):
+        """
+        允许用户自定义 check 方法的逻辑。
+        If func is a coroutine function, it's set as the async check.
+        If func is a regular function, it's set as the sync check.
+        """
+        if asyncio.iscoroutinefunction(func):
+            self._custom_async_check_fn = func
+            self._custom_check_fn = None # Clear sync if async is set
+            # logger.debug(f"Runnable '{self.name}': Custom ASYNC check function set.")
+        elif callable(func):
+            self._custom_check_fn = func
+            self._custom_async_check_fn = None # Clear async if sync is set
+            # logger.debug(f"Runnable '{self.name}': Custom SYNC check function set.")
+        else:
+            raise TypeError("Custom check function must be callable or a coroutine function.")
+        self.clear_cache('_check_cache')
         return self
 
     def on_error(self, error_handler_runnable: 'Runnable'):
-        """指定一个 Runnable 作为错误处理器。"""
         if not isinstance(error_handler_runnable, Runnable):
             raise TypeError("Error handler must be a Runnable instance.")
         self._error_handler = error_handler_runnable
-        # logger.debug(f"Runnable '{self.name}': Error handler set to '{error_handler_runnable.name}'.")
         return self
 
     def retry(self, max_attempts: int = 3, delay_seconds: Union[int, float] = 1, retry_on_exceptions: Union[Type[Exception], Tuple[Type[Exception], ...]] = (Exception,)):
-        """配置重试逻辑。"""
         if not isinstance(max_attempts, int) or max_attempts < 1:
             raise ValueError("max_attempts must be a positive integer.")
         if not isinstance(delay_seconds, (int, float)) or delay_seconds < 0:
@@ -322,31 +329,31 @@ class Runnable(abc.ABC):
             "delay_seconds": delay_seconds,
             "retry_on_exceptions": retry_exceptions_tuple
         }
-        # logger.debug(f"Runnable '{self.name}': Retry configured (max_attempts={max_attempts}, delay_seconds={delay_seconds}s).")
         return self
 
     def clear_cache(self, cache_name: str = 'all'):
         if cache_name == '_invoke_cache' or cache_name == 'all':
             self._invoke_cache.clear()
-            # logger.debug(f"Runnable '{self.name}': Invoke cache cleared.")
         if cache_name == '_check_cache' or cache_name == 'all':
             self._check_cache.clear()
-            # logger.debug(f"Runnable '{self.name}': Check cache cleared.")
         return self
 
     def __or__(self, other: Union['Runnable', Dict[str, 'Runnable']]) -> 'Runnable':
+        return NotImplemented
+
+    def __or__(self, other: Union['Runnable', Dict[str, 'Runnable']]) -> 'Runnable':
+        # This version of __or__ will always create a synchronous Pipeline/BranchAndFanIn.
+        # AsyncRunnable will override __or__ and __ror__ to create AsyncPipeline.
         if isinstance(other, Runnable):
-            # Simple A | B
             return Pipeline(self, other, name=f"({self.name} | {other.name})")
         elif isinstance(other, dict) and all(isinstance(r, Runnable) for r in other.values()):
-            # A | {"C": C_task, "D": D_task}
-            # This implies a BranchAndFanIn immediately after self.
-            # So, self -> BranchAndFanIn(other)
             branch_fan_in = BranchAndFanIn(other, name=f"BranchFanIn_after_{self.name}")
             return Pipeline(self, branch_fan_in, name=f"({self.name} | {branch_fan_in.name})")
         return NotImplemented
 
     def __mod__(self, true_branch: 'Runnable') -> '_PendingConditional':
+        # This version creates a synchronous _PendingConditional.
+        # AsyncRunnable will override __mod__ for _AsyncPendingConditional.
         if not isinstance(true_branch, Runnable):
             return NotImplemented
         return _PendingConditional(self, true_branch)
@@ -356,16 +363,9 @@ class Runnable(abc.ABC):
 
     def copy(self) -> 'Runnable':
         import copy
-        # Try deepcopy first for better isolation
-        # logger.debug(f"Runnable '{self.name}': Attempting deepcopy...")
         new_runnable = copy.deepcopy(self)
-        # logger.debug(f"Runnable '{self.name}': Deepcopy successful. New ID: {id(new_runnable)}")
-        
-        # Reset caches and potentially other runtime state for the copy
         new_runnable._invoke_cache = {}
         new_runnable._check_cache = {}
-        # Name will be reassigned by WorkflowGraph if added as a new node
-        # new_runnable.name = f"{self.name}_copy_{id(new_runnable)}" # Temporary unique name
         return new_runnable
 
 
@@ -384,10 +384,9 @@ class _PendingConditional:
 
 class SimpleTask(Runnable):
     def __init__(self, func: Callable, name: Optional[str] = None, input_declaration: Any = None, **kwargs):
-        # Use func.__name__ as default name, fallback to class name + id
         default_name = getattr(func, '__name__', None)
-        if default_name == '<lambda>': # Handle lambda names specifically
-             default_name = None # Let base class generate name if it's just <lambda>
+        if default_name == '<lambda>': 
+             default_name = None 
 
         super().__init__(name or default_name, input_declaration=input_declaration, **kwargs)
         
@@ -396,52 +395,34 @@ class SimpleTask(Runnable):
         self.func = func
 
     def _internal_invoke(self, input_data: Any, context: ExecutionContext) -> Any:
-        # logger.debug(f"SimpleTask '{self.name}': _internal_invoke called with input_data type: {type(input_data)}")
         if input_data is NO_INPUT:
-            # This case implies that input_declaration (if any) did not resolve to a value,
-            # or there was no input_declaration and no direct input.
-            # logger.debug(f"SimpleTask '{self.name}': Calling func without arguments (input_data is NO_INPUT).")
             return self.func()
         elif isinstance(input_data, dict):
-            # logger.debug(f"SimpleTask '{self.name}': Calling func with kwargs: {list(input_data.keys())}")
             return self.func(**input_data)
         else:
-            # logger.debug(f"SimpleTask '{self.name}': Calling func with positional arg: {str(input_data)[:60]}")
             return self.func(input_data)
 
 
 class Pipeline(Runnable):
     def __init__(self, first: Runnable, second: Runnable, name: Optional[str] = None, **kwargs):
-        # Ensure unique name if not provided
         effective_name = name or f"Pipeline[{first.name}_then_{second.name}]"
-        super().__init__(name=effective_name, **kwargs) # Pass kwargs to base for cache_key_generator etc.
+        super().__init__(name=effective_name, **kwargs) 
         
         if not isinstance(first, Runnable) or not isinstance(second, Runnable):
             raise TypeError("Both 'first' and 'second' must be Runnable instances.")
         self.first = first
         self.second = second
-        # Pipeline's input_declaration could be inherited from `first` if not specified for Pipeline itself.
         if self.input_declaration is None and first.input_declaration is not None:
             self.input_declaration = first.input_declaration
 
 
     def _internal_invoke(self, input_data: Any, context: ExecutionContext) -> Any:
-        # logger.debug(f"DEBUG: Pipeline '{self.name}': Invoking 'first' ({self.first.name}). Input type: {type(input_data).__name__}. Context ID: {id(context)}") # Debug print
         output_first = self.first.invoke(input_data, context)
-        
-        # logger.debug(f"DEBUG: Pipeline '{self.name}': 'first' ({self.first.name}) output type: {type(output_first).__name__}. Invoking 'second' ({self.second.name}). Context ID: {id(context)}") # Debug print
         output_second = self.second.invoke(output_first, context)
-        # logger.debug(f"DEBUG: Pipeline '{self.name}': 'second' ({self.second.name}) output type: {type(output_second).__name__}. Context ID: {id(context)}") # Debug print
         return output_second
 
     def _default_check(self, data_from_invoke: Any) -> bool:
-        # data_from_invoke is the result of self.second.invoke
-        # The check should be performed on the context of self.second
-        return self.second.check(data_from_invoke) # Pass context if check needs it
-
-    def set_check(self, func: Callable[[Any], bool]):
-        # logger.warning(f"Pipeline '{self.name}': Setting custom check. Default behavior uses check of the last element ('{self.second.name}').")
-        return super().set_check(func)
+        return self.second.check(data_from_invoke) 
 
 
 class Conditional(Runnable):
@@ -452,29 +433,18 @@ class Conditional(Runnable):
         self.false_r = false_r
 
     def _internal_invoke(self, input_data: Any, context: ExecutionContext) -> Any:
-        # logger.debug(f"DEBUG: Conditional '{self.name}': Evaluating condition '{self.condition_r.name}'. Input type: {type(input_data).__name__}. Context ID: {id(context)}") # Debug print
         condition_output = self.condition_r.invoke(input_data, context)
         
-        # logger.debug(f"DEBUG: Conditional '{self.name}': Condition '{self.condition_r.name}' output type: {type(condition_output).__name__}. Checking condition. Context ID: {id(context)}") # Debug print
         context.log_event(f"Node '{self.name}': Condition output type: {type(condition_output).__name__}. Checking condition.")
-        if self.condition_r.check(condition_output, context): # Pass context to check
-            # logger.info(f"Conditional '{self.name}': Condition is TRUE. Executing true_branch '{self.true_r.name}'.")
+        if self.condition_r.check(condition_output, context): 
             context.log_event(f"Node '{self.name}': Condition TRUE, executing '{self.true_r.name}'.")
-            # True branch receives the output of the condition runnable
             return self.true_r.invoke(condition_output, context)
         else:
-            # logger.info(f"Conditional '{self.name}': Condition is FALSE. Executing false_branch '{self.false_r.name}'.")
             context.log_event(f"Node '{self.name}': Condition FALSE, executing '{self.false_r.name}'.")
-            # False branch also receives the output of the condition runnable
             return self.false_r.invoke(condition_output, context)
 
 
 class BranchAndFanIn(Runnable):
-    """
-    Implements the {"C": C_task, "D": D_task} part of A | {"C": C, "D": D} | F.
-    Receives a single input, fans it out to multiple parallel tasks,
-    and aggregates their results into a dictionary.
-    """
     def __init__(self, tasks_dict: Dict[str, Runnable], name: Optional[str] = None, max_workers: Optional[int] = None, **kwargs):
         super().__init__(name or f"BranchFanIn_{'_'.join(tasks_dict.keys())}", **kwargs)
         if not isinstance(tasks_dict, dict) or not all(isinstance(r, Runnable) for r in tasks_dict.values()):
@@ -484,7 +454,6 @@ class BranchAndFanIn(Runnable):
 
     def _internal_invoke(self, input_data: Any, context: ExecutionContext) -> Dict[str, Any]:
         results: Dict[str, Any] = {}
-        # logger.info(f"BranchAndFanIn '{self.name}': Starting parallel execution for {len(self.tasks_dict)} tasks. Input type: {type(input_data)}")
         context.log_event(f"Node '{self.name}': Starting parallel execution for {len(self.tasks_dict)} tasks.")
 
         with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
@@ -492,36 +461,30 @@ class BranchAndFanIn(Runnable):
                 executor.submit(task.invoke, input_data, context): key
                 for key, task in self.tasks_dict.items()
             }
+            exceptions = {}
             for future in as_completed(future_to_key):
                 key = future_to_key[future]
                 task_name = self.tasks_dict[key].name
                 try:
                     result = future.result()
                     results[key] = result
-                    # logger.debug(f"BranchAndFanIn '{self.name}': Task '{key}' ({task_name}) completed. Result type: {type(result)}")
                     context.log_event(f"Node '{self.name}', Branch '{key}' ({task_name}): Completed.")
-                    # Optionally, add individual branch outputs to context with prefixed names
-                    # context.add_output(f"{self.name}_{key}", result)
                 except Exception as e:
-                    # logger.error(f"BranchAndFanIn '{self.name}': Task '{key}' ({task_name}) failed: {type(e).__name__}: {e}", exc_info=logger.level <= logging.DEBUG)
                     context.log_event(f"Node '{self.name}', Branch '{key}' ({task_name}): Failed: {type(e).__name__}: {e}")
-                    # How to handle partial failures?
-                    # Option 1: Re-raise immediately.
-                    # Option 2: Collect all results/exceptions and decide.
-                    # Option 3: Let individual tasks' error handlers/retry logic work. If they fail through, then this re-raises.
-                    raise e # For now, re-raise the first exception encountered.
+                    exceptions[key] = e
+            
+            if exceptions:
+                # Aggregate or raise the first/most significant exception
+                # For now, raising the first one encountered by key order
+                first_failed_key = sorted(exceptions.keys())[0]
+                raise exceptions[first_failed_key]
 
-        # logger.info(f"BranchAndFanIn '{self.name}': All parallel tasks completed. Aggregated results: {list(results.keys())}")
+
         context.log_event(f"Node '{self.name}': All parallel tasks completed.")
         return results
 
 
 class SourceParallel(Runnable):
-    """
-    Implements the {"A": A_chain, "B": B_chain} part of {"A": A_chain, "B": B_chain} | H.
-    Receives an initial input (or uses context's initial_input if NO_INPUT),
-    fans it out to multiple parallel task chains, and aggregates their results.
-    """
     def __init__(self, tasks_dict: Dict[str, Runnable], name: Optional[str] = None, max_workers: Optional[int] = None, **kwargs):
         super().__init__(name or f"SourceParallel_{'_'.join(tasks_dict.keys())}", **kwargs)
         if not isinstance(tasks_dict, dict) or not all(isinstance(r, Runnable) for r in tasks_dict.values()):
@@ -534,34 +497,38 @@ class SourceParallel(Runnable):
         context.log_event(f"Node '{self.name}': Starting parallel execution for {len(self.tasks_dict)} tasks. Input type: {type(actual_input).__name__}")
 
         aggregated_results: Dict[str, Any] = {}
-        future_to_branch_info: Dict[Any, Tuple[str, Runnable, ExecutionContext]] = {}
+        # Keep track of futures to handle exceptions properly
+        future_to_branch_key: Dict[Any, str] = {}
+        exceptions = {}
 
         with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
             for key, task_runnable in self.tasks_dict.items():
-                # Create a new, isolated context for each branch.
-                branch_context = ExecutionContext(initial_input=actual_input, parent_context=context)
-                future = executor.submit(task_runnable.invoke, actual_input, branch_context)
-                future_to_branch_info[future] = (key, task_runnable, branch_context)
-
-            for future in as_completed(future_to_branch_info):
-                key, task_runnable, branch_ctx_for_this_branch = future_to_branch_info[future]
-                task_name = task_runnable.name
+                # Each branch in SourceParallel should typically get its own sub-context
+                # if isolation is desired, or use the passed context directly.
+                # For simplicity here, using the main context for each branch.
+                # A more advanced version might create sub-contexts.
+                future = executor.submit(task_runnable.invoke, actual_input, context)
+                future_to_branch_key[future] = key
+            
+            for future in as_completed(future_to_branch_key):
+                key = future_to_branch_key[future]
+                task_name = self.tasks_dict[key].name
                 try:
                     branch_output_value = future.result()
                     aggregated_results[key] = branch_output_value
                     context.log_event(f"Node '{self.name}', Branch '{key}' ({task_name}): Completed. Result type: {type(branch_output_value).__name__}.")
                 except Exception as e:
                     context.log_event(f"Node '{self.name}', Branch '{key}' ({task_name}): FAILED with {type(e).__name__}: {str(e)[:100]}.")
-                    raise
+                    exceptions[key] = e
         
-        # After all branches are completed, add individual branch outputs to the main context
-        # using parentName_branchKey naming convention.
-        for key_of_branch, task_in_branch in self.tasks_dict.items():
-            if key_of_branch in aggregated_results: # Check if this branch actually produced a result
-                branch_output_value = aggregated_results[key_of_branch]
-                context_key_for_branch_output = f"{self.name}_{key_of_branch}"
-                context.add_output(context_key_for_branch_output, branch_output_value)
-                context.log_event(f"Node '{self.name}': Added output for branch '{key_of_branch}' as '{context_key_for_branch_output}' to main context.")
+        if exceptions:
+            first_failed_key = sorted(exceptions.keys())[0]
+            raise exceptions[first_failed_key]
+        
+        for key_of_branch, branch_output_value in aggregated_results.items():
+            context_key_for_branch_output = f"{self.name}_{key_of_branch}"
+            context.add_output(context_key_for_branch_output, branch_output_value)
+            # context.log_event(f"Node '{self.name}': Added output for branch '{key_of_branch}' as '{context_key_for_branch_output}' to main context.")
 
         context.log_event(f"Node '{self.name}': All branches completed. Aggregated results: {list(aggregated_results.keys())}.")
         return aggregated_results
@@ -576,78 +543,49 @@ class While(Runnable):
 
     def _internal_invoke(self, input_data: Any, context: ExecutionContext) -> List[Any]:
         loop_count = 0
-        current_input_for_iteration = input_data # Input for the first condition check AND the first body run
+        current_input_for_iteration = input_data 
         all_body_outputs = []
 
-        # logger.info(f"While '{self.name}': Starting loop. Max loops: {self.max_loops}. Initial input type: {type(current_input_for_iteration).__name__}")
         context.log_event(f"Node '{self.name}': Starting loop (max_loops={self.max_loops}).")
 
         while loop_count < self.max_loops:
-            # logger.debug(f"While '{self.name}': Loop {loop_count + 1}. Evaluating condition '{self.condition_check_runnable.name}'. Input type: {type(current_input_for_iteration).__name__}")
             context.log_event(f"Node '{self.name}': Loop {loop_count + 1}/{self.max_loops}. Evaluating condition '{self.condition_check_runnable.name}'. Input type: {type(current_input_for_iteration).__name__}")
             
-            # Condition check runnable receives the input for the current iteration
             condition_output = self.condition_check_runnable.invoke(current_input_for_iteration, context)
             
-            # logger.debug(f"While '{self.name}': Loop {loop_count + 1}. Condition '{self.condition_check_runnable.name}' output type: {type(condition_output).__name__}. Checking condition.")
             context.log_event(f"Node '{self.name}': Loop {loop_count + 1}. Condition output type: {type(condition_output).__name__}. Checking condition.")
             if not self.condition_check_runnable.check(condition_output, context):
-                # logger.info(f"While '{self.name}': Condition is FALSE. Exiting loop after {loop_count} iterations.")
                 context.log_event(f"Node '{self.name}': Condition FALSE. Exiting loop after {loop_count} iterations.")
                 break
             
-            # logger.debug(f"While '{self.name}': Condition is TRUE. Executing body '{self.body_runnable.name}'. Input type: {type(current_input_for_iteration).__name__}")
             context.log_event(f"Node '{self.name}': Loop {loop_count + 1}, Condition TRUE, executing body '{self.body_runnable.name}'. Body input type: {type(current_input_for_iteration).__name__}")
             
-            # The body's input is the input for the current iteration
             body_output = self.body_runnable.invoke(current_input_for_iteration, context)
             all_body_outputs.append(body_output)
             
-            # The output of the body becomes the input for the next iteration
-            current_input_for_iteration = body_output # Updates input for the next iteration
+            current_input_for_iteration = body_output 
             loop_count += 1
-        else: # Executed if the loop finished due to max_loops, not break
-            # logger.debug(f"DEBUG: While '{self.name}': Max loops reached block entered.") # Debug print
+        else: 
             context.log_event(f"Node '{self.name}': Loop exited due to max_loops ({self.max_loops}) reached.")
 
-        # What to return? Last body_output? List of all body_outputs?
-        # Design choice: return list of all outputs from the body in each iteration.
-        # logger.info(f"While '{self.name}': Loop finished. Returning {len(all_body_outputs)} outputs.")
         context.log_event(f"Node '{self.name}': Loop finished. Returning {len(all_body_outputs)} outputs.")
         return all_body_outputs
 
 
 class MergeInputs(Runnable):
-    """
-    Aggregates multiple inputs from the context based on a mapping,
-    and then calls a merge_function with these inputs as keyword arguments.
-    """
     def __init__(self, input_sources: Dict[str, str], merge_function: Callable[..., Any], name: Optional[str] = None, **kwargs):
-        # input_sources: {"param_name_for_func": "node_name_in_context", ...}
         super().__init__(name or f"MergeInputs_{getattr(merge_function, '__name__', 'custom')}", **kwargs)
         self.input_sources = input_sources
         self.merge_function = merge_function
-        # This Runnable inherently declares its inputs via input_sources.
-        # We can set self.input_declaration here for consistency, though it's somewhat redundant.
-        self.input_declaration = self.input_sources # Or a transformation of it if needed by base class
+        self.input_declaration = self.input_sources 
 
     def _internal_invoke(self, input_data: Any, context: ExecutionContext) -> Any:
-        # input_data to MergeInputs is typically NO_INPUT, as it fetches from context.
-        # If input_data is provided, it's currently ignored by this implementation.
-        
         kwargs_for_func = {}
-        # logger.debug(f"MergeInputs '{self.name}': Fetching inputs from context based on sources: {self.input_sources}")
         context.log_event(f"Node '{self.name}': Fetching inputs from context: {list(self.input_sources.values())}")
 
         for param_name, source_node_name in self.input_sources.items():
             value = context.get_output(source_node_name)
-            # logger.debug(f"MergeInputs '{self.name}': Fetched '{source_node_name}' -> '{param_name}': {str(value)[:60]}")
-            # Decide on behavior if value is None or not found. Passing None for now.
             kwargs_for_func[param_name] = value
         
-        # logger.info(f"MergeInputs '{self.name}': Calling merge_function '{getattr(self.merge_function, '__name__', 'custom')}' with keys: {list(kwargs_for_func.keys())}")
         context.log_event(f"Node '{self.name}': Calling merge_function '{getattr(self.merge_function, '__name__', 'custom')}'.")
         return self.merge_function(**kwargs_for_func)
-
-# WorkflowGraph and CompiledGraph will be substantial and are best placed in a separate file
-# or added later in this file. For now, this covers the initial set of Runnables.

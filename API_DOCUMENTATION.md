@@ -6,7 +6,7 @@
 
 ```
 .
-├── core/
+├── taskpipe/
 │   ├── __init__.py
 │   ├── graph.py       # 包含 WorkflowGraph 和 CompiledGraph
 │   └── runnables.py   # 包含 Runnable/AsyncRunnable 基类及其各种实现, ExecutionContext
@@ -167,7 +167,7 @@ classDiagram
 
 ## 核心 API
 
-### 1. `core.runnables.ExecutionContext` (同步/异步)
+### 1. `taskpipe.runnables.ExecutionContext` (同步/异步)
 
 此类用于在工作流执行期间携带状态和节点输出。
 
@@ -189,7 +189,7 @@ classDiagram
 
 *   `NO_INPUT`: 一个哨兵对象，标记 `Runnable` 没有接收到直接输入，应尝试从上下文获取。
 
-### 2. `core.runnables.Runnable` (ABC) 和 `AsyncRunnable`
+### 2. `taskpipe.runnables.Runnable` (ABC) 和 `AsyncRunnable`
 
 所有可执行单元的抽象基类。
 
@@ -220,7 +220,7 @@ classDiagram
 *   `__or__` (`|`): 用于链接 `Runnable` (创建 `Pipeline` 或 `BranchAndFanIn`)。
 *   `__mod__` (`%`), `__rshift__` (`>>`): 用于创建 `Conditional` `Runnable`。
 
-### 3. `core.runnables` 中的具体实现
+### 3. `taskpipe.runnables` 中的具体实现
 
 #### 同步实现
 
@@ -244,7 +244,7 @@ classDiagram
 * **`AsyncBranchAndFanIn`**: 异步分支合并实现
 * **`AsyncSourceParallel`**: 异步并行源实现
 
-### 4. `core.graph.WorkflowGraph` (同步/异步)
+### 4. `taskpipe.graph.WorkflowGraph` (同步/异步)
 
 用于构建工作流图的构建器类。
 
@@ -265,7 +265,7 @@ classDiagram
 *   `set_output_nodes(self, node_names: List[str]) -> 'WorkflowGraph'`: 设置图的输出节点。
 *   `compile(self) -> 'CompiledGraph'`: 分析图结构，执行拓扑排序，并返回一个可执行的 `CompiledGraph` 实例。
 
-### 5. `core.graph.CompiledGraph(Runnable)`
+### 5. `taskpipe.graph.CompiledGraph(Runnable)`
 
 `WorkflowGraph` 的可运行表示。
 
@@ -324,7 +324,7 @@ async def main():
 此示例演示了如何创建一个带有条件分支的线性流水线。工作流接收一个初始值，根据该值是否大于10来选择不同的处理路径，最后对结果进行统一的后续处理。
 
 ```python
-from core.runnables import SimpleTask, ExecutionContext, Runnable, NO_INPUT
+from taskpipe.runnables import SimpleTask, ExecutionContext, Runnable, NO_INPUT
 
 # 1. 定义任务函数
 def get_initial_value_input(start_val: int = 2) -> int: # 允许外部传入，默认为2
@@ -387,7 +387,7 @@ print(f"Result for Example 1 (Input 12): {result1_val12}")
 此示例展示了如何并行执行两个（或多个）独立的工作流或任务，然后将它们的输出聚合起来进行后续处理。这里我们使用 `SourceParallel` 来启动并行分支，每个分支都从相同的初始输入开始（或者像这里一样，它们是自包含的源）。
 
 ```python
-from core.runnables import SimpleTask, ExecutionContext, NO_INPUT, SourceParallel
+from taskpipe.runnables import SimpleTask, ExecutionContext, NO_INPUT, SourceParallel
 
 # (假设前面示例中的函数和类已定义，或在此处重新定义简化版本)
 # For brevity, let's define simplified work1_like and work2_like tasks
@@ -439,7 +439,7 @@ print(f"Result for Example 2: {result2}")
 此示例演示了如何将一个任务(A)的输出扇出到多个并行任务(B,C)，然后将这些并行任务的聚合结果（一个字典）传递给下一个处理步骤(D)。
 
 ```python
-from core.runnables import SimpleTask, ExecutionContext, NO_INPUT # SourceParallel (if needed for A)
+from taskpipe.runnables import SimpleTask, ExecutionContext, NO_INPUT # SourceParallel (if needed for A)
 
 # 1. 定义初始任务 (A)
 def get_base_data_for_fan_out() -> str:

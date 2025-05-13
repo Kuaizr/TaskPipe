@@ -4,8 +4,6 @@ setup(
     name="taskpipe",
     version="0.1.0",
     description="A Python task processing library",
-    long_description=open("README.md").read(),
-    long_description_content_type="text/markdown",
     author="kuaizhirui",
     author_email="kuaizhirui@gmail.com",
     packages=find_packages(),

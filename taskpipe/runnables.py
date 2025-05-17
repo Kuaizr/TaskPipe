@@ -11,9 +11,8 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 NO_INPUT = object()
 
 logger = logging.getLogger(__name__)
-# 为了避免重复配置（如果用户在其他地方也配置了basicConfig）
-if not logger.hasHandlers():
-    logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+# 为了避免重复配置（如果用户在其他地方也配置了basicConfig），这里不再配置basicConfig
+# 而是依赖用户在应用层配置logging
 
 class ExecutionContext:
     """
@@ -129,6 +128,10 @@ class Runnable(abc.ABC):
         self._error_handler: Optional['Runnable'] = None
         self._retry_config: Optional[Dict[str, Any]] = None
         self.input_declaration: Any = input_declaration
+# TODO: Add documentation on how to create a custom cache_key_generator.
+        # Explain the importance of considering the input data, context, and input_declaration when generating the cache key.
+        # Also, consider adding a "How to create a custom Runnable" section to the documentation,
+        # providing best practices and examples.
         self._cache_key_generator = cache_key_generator or _default_cache_key_generator
 
     def _get_cache_key(self, input_data: Any, context: Optional[ExecutionContext]) -> Any:

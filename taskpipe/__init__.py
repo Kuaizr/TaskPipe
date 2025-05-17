@@ -1,3 +1,6 @@
+import logging
+logger = logging.getLogger(__name__)
+logger.addHandler(logging.NullHandler())
 # 从 runnables 模块提升常用类
 from .runnables import (
     ExecutionContext,

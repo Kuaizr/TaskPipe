@@ -233,58 +233,58 @@ classDiagram
 
 * `name: str`: `Runnable` 实例的名称。如果未提供，则基于类名和对象ID自动生成。
 * `input_declaration: Any`: 定义 `Runnable` 如何从 `ExecutionContext` 获取其输入数据，当 `invoke` 或 `invoke_async` 的 `input_data` 参数为 `NO_INPUT` 时生效。可以是：
-    * 字符串: 从上下文中获取名为该字符串的单个节点输出作为输入。
-    * 字典 (`Dict[str, str]` 或 `Dict[str, Any]`): 将字典的值（通常是上下文中的节点名）映射到字典的键（作为 `_internal_invoke` 的关键字参数）。如果值不是字符串，则直接作为参数值。
-    * 可调用对象 (`Callable[[ExecutionContext], Any]`): 一个函数，接收 `ExecutionContext`，返回实际输入数据。
+  * 字符串: 从上下文中获取名为该字符串的单个节点输出作为输入。
+  * 字典 (`Dict[str, str]` 或 `Dict[str, Any]`): 将字典的值（通常是上下文中的节点名）映射到字典的键（作为 `_internal_invoke` 的关键字参数）。如果值不是字符串，则直接作为参数值。
+  * 可调用对象 (`Callable[[ExecutionContext], Any]`): 一个函数，接收 `ExecutionContext`，返回实际输入数据。
 * `_invoke_cache: Dict[Any, Any]`: 内部字典，用于缓存 `invoke` 方法的结果。键由 `_cache_key_generator` 生成。
 * `_check_cache: Dict[Any, bool]`: 内部字典，用于缓存 `check` 方法的结果。键是 `data_from_invoke` 序列化后的结果。
 * `_custom_check_fn: Optional[Callable[[Any], bool]]`: 用户定义的同步检查函数。
 * `_custom_async_check_fn: Optional[Callable[[Any], Coroutine[Any, Any, bool]]]` : 用户定义的异步检查协程函数。通过 `set_check` 方法设置。
 * `_error_handler: Optional['Runnable']`: 当此 `Runnable` 执行失败且不重试时，调用的错误处理 `Runnable`。
 * `_retry_config: Optional[Dict[str, Any]]`: 包含重试参数的字典，如 `max_attempts`, `delay_seconds`, `retry_on_exceptions`。
-* `_cache_key_generator: Callable`: 一个函数，用于根据输入数据和上下文生成缓存键。默认为 `_default_cache_key_generator`。
+* `_cache_key_generator: Callable`: 一个函数，用于根据输入数据和上下文生成缓存键。默认为 `_default_cache_key_generator`。**自定义 `cache_key_generator` 时，请务必考虑输入数据、上下文和 `input_declaration`，以确保缓存键的唯一性和有效性。**
 
 **主要方法:**
 
 * `__init__(self, name: Optional[str] = None, input_declaration: Any = None, cache_key_generator: Optional[Callable] = None)`: 构造函数。
 * `invoke(self, input_data: Any = NO_INPUT, context: Optional[ExecutionContext] = None) -> Any`:
-    * **同步执行** `Runnable` 的核心公共方法。
-    * 管理执行流程：创建或使用 `ExecutionContext`，解析输入数据 (基于 `input_data` 和 `input_declaration`)，检查缓存，执行重试逻辑，调用 `_internal_invoke`，处理错误，存储缓存和上下文输出。
-    * **重要**: 如果此 `Runnable` 实际上是一个 `AsyncRunnable` 的实例 (如 `AsyncPipeline`)，直接从此方法调用（而不是从其子类的 `_internal_invoke` 中调用 `asyncio.run`）可能不会按预期工作，因为基类 `Runnable.invoke` 未设计为直接启动异步事件循环。`AsyncRunnable` 通过重写 `_internal_invoke` 来桥接同步调用和其异步核心。
+  * **同步执行** `Runnable` 的核心公共方法。
+  * 管理执行流程：创建或使用 `ExecutionContext`，解析输入数据 (基于 `input_data` 和 `input_declaration`)，检查缓存，执行重试逻辑，调用 `_internal_invoke`，处理错误，存储缓存和上下文输出。
+  * **重要**: 如果此 `Runnable` 实际上是一个 `AsyncRunnable` 的实例 (如 `AsyncPipeline`)，直接从此方法调用（而不是从其子类的 `_internal_invoke` 中调用 `asyncio.run`）可能不会按预期工作，因为基类 `Runnable.invoke` 未设计为直接启动异步事件循环。`AsyncRunnable` 通过重写 `_internal_invoke` 来桥接同步调用和其异步核心。
 * `_internal_invoke(self, input_data: Any, context: ExecutionContext) -> Any`: (抽象方法) **同步**子类必须实现此方法以定义其核心同步逻辑。对于 `AsyncRunnable`，此方法通常会调用 `asyncio.run(self._internal_invoke_async(...))` 来执行其异步逻辑，但这有一个重要前提：**不能在已运行的 `asyncio` 事件循环中调用 `asyncio.run()`，否则会导致 `RuntimeError`。**
 * `invoke_async(self, input_data: Any = NO_INPUT, context: Optional[ExecutionContext] = None) -> Coroutine[Any, Any, Any]`:
-    * **异步执行** `Runnable` 的核心公共方法。
-    * 对于普通的同步 `Runnable`，此默认实现会将其同步的 `invoke()` 方法包装在 `ThreadPoolExecutor` 中运行，从而允许它在异步流程中非阻塞地执行。
-    * `AsyncRunnable` 子类会重写此方法以提供其原生的异步执行逻辑，通常包括缓存、重试、错误处理，并最终 `await self._internal_invoke_async(...)`。
+  * **异步执行** `Runnable` 的核心公共方法。
+  * 对于普通的同步 `Runnable`，此默认实现会将其同步的 `invoke()` 方法包装在 `ThreadPoolExecutor` 中运行，从而允许它在异步流程中非阻塞地执行。
+  * `AsyncRunnable` 子类会重写此方法以提供其原生的异步执行逻辑，通常包括缓存、重试、错误处理，并最终 `await self._internal_invoke_async(...)`。
 * `check(self, data_from_invoke: Any, context: Optional[ExecutionContext] = None) -> bool`:
-    * 对 `invoke` (或 `invoke_async`) 的结果进行验证或条件检查。
-    * 使用 `_custom_check_fn` (如果已设置)，否则调用 `_default_check`。结果会被缓存。
+  * 对 `invoke` (或 `invoke_async`) 的结果进行验证或条件检查。
+  * 使用 `_custom_check_fn` (如果已设置)，否则调用 `_default_check`。结果会被缓存。
 * `_default_check(self, data_from_invoke: Any) -> bool`: 默认的同步检查逻辑，简单地对 `data_from_invoke` 进行布尔转换。
 * `check_async(self, data_from_invoke: Any, context: Optional[ExecutionContext] = None) -> Coroutine[Any, Any, bool]`:
-    * 异步检查方法。
-    * 如果设置了 `_custom_async_check_fn`，则 `await` 它。
-    * 否则，对于同步 `Runnable`，此默认实现会将其同步的 `check()` 方法包装在 `ThreadPoolExecutor` 中运行。
-    * `AsyncRunnable` 子类会重写此方法（或依赖其 `_custom_async_check_fn` / `_default_check_async`）。
+  * 异步检查方法。
+  * 如果设置了 `_custom_async_check_fn`，则 `await` 它。
+  * 否则，对于同步 `Runnable`，此默认实现会将其同步的 `check()` 方法包装在 `ThreadPoolExecutor` 中运行。
+  * `AsyncRunnable` 子类会重写此方法（或依赖其 `_custom_async_check_fn` / `_default_check_async`）。
 * `_default_check_async(self, data_from_invoke: Any) -> Coroutine[Any, Any, bool]`:
-    * `Runnable` 基类中的默认异步检查逻辑是简单地对数据进行布尔转换并返回。
-    * `AsyncRunnable` 子类应重写此方法以提供真正的异步检查逻辑。
+  * `Runnable` 基类中的默认异步检查逻辑是简单地对数据进行布尔转换并返回。
+  * `AsyncRunnable` 子类应重写此方法以提供真正的异步检查逻辑。
 * `set_check(self, func: Union[Callable[[Any], bool], Callable[[Any], Coroutine[Any, Any, bool]]]) -> 'Runnable'`:
-    * 允许用户自定义 `check` 方法的逻辑。
-    * 如果 `func` 是一个协程函数 (通过 `asyncio.iscoroutinefunction` 判断)，它将被设置为 `_custom_async_check_fn`，同时 `_custom_check_fn` 会被清除。
-    * 如果 `func` 是一个普通的可调用函数，它将被设置为 `_custom_check_fn`，同时 `_custom_async_check_fn` 会被清除。
-    * 调用此方法会清除 `_check_cache`。
+  * 允许用户自定义 `check` 方法的逻辑。
+  * 如果 `func` 是一个协程函数 (通过 `asyncio.iscoroutinefunction` 判断)，它将被设置为 `_custom_async_check_fn`，同时 `_custom_check_fn` 会被清除。
+  * 如果 `func` 是一个普通的可调用函数，它将被设置为 `_custom_check_fn`，同时 `_custom_async_check_fn` 会被清除。
+  * 调用此方法会清除 `_check_cache`。
 * `on_error(self, error_handler_runnable: 'Runnable') -> 'Runnable'`: 指定一个 `Runnable` 作为当前任务失败时的错误处理器。
 * `retry(self, max_attempts: int = 3, delay_seconds: Union[int, float] = 1, retry_on_exceptions: Union[Type[Exception], Tuple[Type[Exception], ...]] = (Exception,)) -> 'Runnable'`: 配置当前任务的重试逻辑。
 * `clear_cache(self, cache_name: str = 'all') -> 'Runnable'`: 清除 `_invoke_cache` 和/或 `_check_cache`。
 * `copy(self) -> 'Runnable'`: 创建 `Runnable` 的深拷贝副本，并清除新副本的缓存。
 * `__or__(self, other: Union['Runnable', Dict[str, 'Runnable']]) -> 'Runnable'`:
-    * 操作符 `|` 的实现。
-    * 如果 `other` 是 `Runnable`，通常返回一个 `Pipeline` (或 `AsyncPipeline`，如果任一方是异步的)。
-    * 如果 `other` 是 `Dict[str, Runnable]`，通常先用 `BranchAndFanIn` (或 `AsyncBranchAndFanIn`) 包装 `other`，然后与 `self` 组成 `Pipeline` (或 `AsyncPipeline`)。
+  * 操作符 `|` 的实现。
+  * 如果 `other` 是 `Runnable`，通常返回一个 `Pipeline` (或 `AsyncPipeline`，如果任一方是异步的)。
+  * 如果 `other` 是 `Dict[str, Runnable]`，通常先用 `BranchAndFanIn` (或 `AsyncBranchAndFanIn`) 包装 `other`，然后与 `self` 组成 `Pipeline` (或 `AsyncPipeline`)。
 * `__mod__(self, true_branch: 'Runnable') -> '_PendingConditional'`:
-    * 操作符 `%` 的实现，用于条件逻辑的开始。返回一个中间对象 (`_PendingConditional` 或 `_AsyncPendingConditional`)。
+  * 操作符 `%` 的实现，用于条件逻辑的开始。返回一个中间对象 (`_PendingConditional` 或 `_AsyncPendingConditional`)。
 * `_PendingConditional.__rshift__(self, false_r: 'Runnable') -> 'Conditional'`:
-    * 操作符 `>>` 的实现，用于完成条件逻辑的定义，返回一个 `Conditional` (或 `AsyncConditional`) 实例。
+  * 操作符 `>>` 的实现，用于完成条件逻辑的定义，返回一个 `Conditional` (或 `AsyncConditional`) 实例。
 
 ### 3. `taskpipe.async_runnables.AsyncRunnable` (ABC)
 
@@ -298,28 +298,28 @@ classDiagram
 **主要方法 (重写或新增):**
 
 * `invoke_async(self, input_data: Any = NO_INPUT, context: Optional[ExecutionContext] = None) -> Coroutine[Any, Any, Any]`:
-    * **原生异步执行** `AsyncRunnable` 的核心公共方法。
-    * 管理执行流程：创建或使用 `ExecutionContext`，解析输入数据 (基于 `input_data` 和 `input_declaration`，支持异步 `input_declaration` 函数)，检查缓存，执行异步重试逻辑，`await self._internal_invoke_async(...)`，处理错误 (错误处理器也通过 `invoke_async` 调用)，存储缓存和上下文输出。
-    * 这是在异步代码中执行 `AsyncRunnable` 的 **推荐方式**。
+  * **原生异步执行** `AsyncRunnable` 的核心公共方法。
+  * 管理执行流程：创建或使用 `ExecutionContext`，解析输入数据 (基于 `input_data` 和 `input_declaration`，支持异步 `input_declaration` 函数)，检查缓存，执行异步重试逻辑，`await self._internal_invoke_async(...)`，处理错误 (错误处理器也通过 `invoke_async` 调用)，存储缓存和上下文输出。
+  * 这是在异步代码中执行 `AsyncRunnable` 的 **推荐方式**。
 * `_internal_invoke_async(self, input_data: Any, context: ExecutionContext) -> Coroutine[Any, Any, Any]`: (抽象方法) **异步**子类必须实现此方法以定义其核心异步逻辑。
 * `check_async(self, data_from_invoke: Any, context: Optional[ExecutionContext] = None) -> Coroutine[Any, Any, bool]`:
-    * 原生异步检查方法。
-    * 使用 `_custom_async_check_fn` (如果已设置)，否则 `await self._default_check_async(...)`。结果会被缓存。
+  * 原生异步检查方法。
+  * 使用 `_custom_async_check_fn` (如果已设置)，否则 `await self._default_check_async(...)`。结果会被缓存。
 * `_default_check_async(self, data_from_invoke: Any) -> Coroutine[Any, Any, bool]`: (抽象方法或提供默认实现) 默认的原生异步检查逻辑。简单实现可以是 `async def _default_check_async(self, data_from_invoke: Any) -> bool: return bool(data_from_invoke)`。
 * `_internal_invoke(self, input_data: Any, context: ExecutionContext) -> Any`:
-    * (已在 `AsyncRunnable` 中实现) 这是为了让 `AsyncRunnable` 实例也能响应同步的 `Runnable.invoke()` 调用。
-    * 它内部实现通常是：
-        ```python
-        try:
-            loop = asyncio.get_running_loop()
-            if loop.is_running():
-                logger.error(f"FATAL: AsyncRunnable '{self.name}'._internal_invoke called synchronously from an async context. This is not supported correctly. Use invoke_async.")
-                raise RuntimeError(f"AsyncRunnable '{self.name}' cannot be invoked synchronously using _internal_invoke from an already running event loop.")
-        except RuntimeError: # No running event loop
-             pass
-        return asyncio.run(self._internal_invoke_async(input_data, context))
-        ```
-    * **警告**：如果在已运行的 `asyncio` 事件循环中调用此方法 (即 `AsyncRunnable` 实例的同步 `invoke()` 方法)，会导致 `RuntimeError`。
+  * (已在 `AsyncRunnable` 中实现) 这是为了让 `AsyncRunnable` 实例也能响应同步的 `Runnable.invoke()` 调用。
+  * 它内部实现通常是：
+    ```python
+    try:
+        loop = asyncio.get_running_loop()
+        if loop.is_running():
+            logger.error(f"FATAL: AsyncRunnable '{self.name}'._internal_invoke called synchronously from an async context. This is not supported correctly. Use invoke_async.")
+            raise RuntimeError(f"AsyncRunnable '{self.name}' cannot be invoked synchronously using _internal_invoke from an already running event loop.")
+    except RuntimeError: # No running event loop
+         pass
+    return asyncio.run(self._internal_invoke_async(input_data, context))
+    ```
+  * **警告**：如果在已运行的 `asyncio` 事件循环中调用此方法 (即 `AsyncRunnable` 实例的同步 `invoke()` 方法)，会导致 `RuntimeError`。
 
 **操作符重载 (`__or__`, `__ror__`, `__mod__`)**:
 
@@ -331,43 +331,43 @@ classDiagram
 #### 同步实现 (`taskpipe.runnables`)
 
 * **`SimpleTask(Runnable)`**: 将普通函数包装成同步 `Runnable`。
-    * `__init__(self, func: Callable, name: Optional[str] = None, input_declaration: Any = None, **kwargs)`: `func` 是要执行的同步函数。
+  * `__init__(self, func: Callable, name: Optional[str] = None, input_declaration: Any = None, **kwargs)`: `func` 是要执行的同步函数。
 * **`Pipeline(Runnable)`**: 按顺序同步执行两个 `Runnable`。
-    * `__init__(self, first: Runnable, second: Runnable, name: Optional[str] = None, **kwargs)`
+  * `__init__(self, first: Runnable, second: Runnable, name: Optional[str] = None, **kwargs)`
 * **`Conditional(Runnable)`**: 根据同步条件执行两个分支之一。
-    * `__init__(self, condition_r: Runnable, true_r: Runnable, false_r: Runnable, name: Optional[str] = None, **kwargs)`
+  * `__init__(self, condition_r: Runnable, true_r: Runnable, false_r: Runnable, name: Optional[str] = None, **kwargs)`
 * **`BranchAndFanIn(Runnable)`**: 将单个输入扇出到多个并行同步任务（使用 `ThreadPoolExecutor`），并聚合结果。
-    * `__init__(self, tasks_dict: Dict[str, Runnable], name: Optional[str] = None, max_workers: Optional[int] = None, **kwargs)`
+  * `__init__(self, tasks_dict: Dict[str, Runnable], name: Optional[str] = None, max_workers: Optional[int] = None, **kwargs)`
 * **`SourceParallel(Runnable)`**: 并行同步执行多个任务链（使用 `ThreadPoolExecutor`），每个链接收相同的初始输入（或从上下文的 `initial_input` 获取）。
-    * `__init__(self, tasks_dict: Dict[str, Runnable], name: Optional[str] = None, max_workers: Optional[int] = None, **kwargs)`
+  * `__init__(self, tasks_dict: Dict[str, Runnable], name: Optional[str] = None, max_workers: Optional[int] = None, **kwargs)`
 * **`While(Runnable)`**: 根据同步条件重复执行一个同步 `Runnable` 主体。
-    * `__init__(self, condition_check_runnable: Runnable, body_runnable: Runnable, max_loops: int = 100, name: Optional[str] = None, **kwargs)`
+  * `__init__(self, condition_check_runnable: Runnable, body_runnable: Runnable, max_loops: int = 100, name: Optional[str] = None, **kwargs)`
 * **`MergeInputs(Runnable)`**: 从上下文收集多个输入，并传递给一个同步合并函数。
-    * `__init__(self, input_sources: Dict[str, str], merge_function: Callable[..., Any], name: Optional[str] = None, **kwargs)`
+  * `__init__(self, input_sources: Dict[str, str], merge_function: Callable[..., Any], name: Optional[str] = None, **kwargs)`
 
 #### 异步实现 (`taskpipe.async_runnables`)
 
 这些组合器被设计为可以处理其子任务是同步 `Runnable` 还是异步 `AsyncRunnable` 的情况。它们总是通过 `invoke_async` (或 `check_async`) 来调用子任务。
 
 * **`AsyncPipeline(AsyncRunnable)`**:
-    * 按顺序异步执行两个 `Runnable`（可以是同步或异步）。
-    * 如果子任务是同步 `Runnable`，会 `await task.invoke_async(input, context)` (即在线程池中运行其同步 `invoke`)。
-    * 如果子任务是 `AsyncRunnable`，会直接 `await task.invoke_async(input, context)`。
+  * 按顺序异步执行两个 `Runnable`（可以是同步或异步）。
+  * 如果子任务是同步 `Runnable`，会 `await task.invoke_async(input, context)` (即在线程池中运行其同步 `invoke`)。
+  * 如果子任务是 `AsyncRunnable`，会直接 `await task.invoke_async(input, context)`。
 * **`AsyncConditional(AsyncRunnable)`**:
-    * 条件 `Runnable` (condition\_r) 通过 `await condition_r.check_async(...)` 进行检查。
-    * 根据结果，对真分支或假分支的 `Runnable` (true\_r 或 false\_r) 调用 `await branch.invoke_async(...)`。
+  * 条件 `Runnable` (condition\_r) 通过 `await condition_r.check_async(...)` 进行检查。
+  * 根据结果，对真分支或假分支的 `Runnable` (true\_r 或 false\_r) 调用 `await branch.invoke_async(...)`。
 * **`AsyncBranchAndFanIn(AsyncRunnable)`**:
-    * 将单个输入异步扇出到 `tasks_dict` 中的多个并行任务。
-    * 对每个任务调用 `task.invoke_async(input, context)`，并使用 `asyncio.gather(*coros, return_exceptions=True)` 来并发执行和收集结果。
-    * 如果任何任务抛出异常，会收集所有异常并重新抛出第一个。
+  * 将单个输入异步扇出到 `tasks_dict` 中的多个并行任务。
+  * 对每个任务调用 `task.invoke_async(input, context)`，并使用 `asyncio.gather(*coros, return_exceptions=True)` 来并发执行和收集结果。
+  * 如果任何任务抛出异常，会收集所有异常并重新抛出第一个。
 * **`AsyncSourceParallel(AsyncRunnable)`**:
-    * 并行异步执行 `tasks_dict` 中的多个任务链，每个链接收相同的初始输入（或从上下文的 `initial_input` 获取）。
-    * 对每个任务调用 `task.invoke_async(input, context)`，并使用 `asyncio.gather(*coros, return_exceptions=True)`。
-    * 处理方式类似于 `AsyncBranchAndFanIn`。
+  * 并行异步执行 `tasks_dict` 中的多个任务链，每个链接收相同的初始输入（或从上下文的 `initial_input` 获取）。
+  * 对每个任务调用 `task.invoke_async(input, context)`，并使用 `asyncio.gather(*coros, return_exceptions=True)`。
+  * 处理方式类似于 `AsyncBranchAndFanIn`。
 * **`AsyncWhile(AsyncRunnable)`**:
-    * `condition_check_runnable` 通过 `await condition_check_runnable.check_async(...)` 进行检查。
-    * 如果条件为真，`body_runnable` 通过 `await body_runnable.invoke_async(...)` 执行。
-    * 重复直到条件为假或达到 `max_loops`。
+  * `condition_check_runnable` 通过 `await condition_check_runnable.check_async(...)` 进行检查。
+  * 如果条件为真，`body_runnable` 通过 `await body_runnable.invoke_async(...)` 执行。
+  * 重复直到条件为假或达到 `max_loops`。
 
 ### 5. `taskpipe.graph.WorkflowGraph`
 
@@ -407,44 +407,45 @@ classDiagram
 **执行**:
 
 * `_internal_invoke(self, input_data: Any, context: ExecutionContext) -> Any`:
-    * **同步执行**整个图。
-    * 创建一个内部的 `ExecutionContext` (其父级是传入的 `context`)。
-    * 按 `sorted_nodes` 的顺序遍历节点。
-    * 对每个节点：
-        * 调用 `_prepare_node_input` 来确定该节点的输入（基于图的初始输入、父节点输出、`input_mapper` 或节点的 `input_declaration`）。
-        * 调用节点的同步 `node.invoke(node_input, internal_graph_context)`。
-    * 收集 `output_nodes` 的结果并返回。
-    * **警告**：如果图中包含 `AsyncRunnable` 节点，并且 `CompiledGraph.invoke()` 是在一个已运行的 `asyncio` 事件循环中被调用的，那么这些 `AsyncRunnable` 节点的 `invoke()` (内部使用 `asyncio.run()`) 会导致 `RuntimeError`。
+  * **同步执行**整个图。
+  * 创建一个内部的 `ExecutionContext` (其父级是传入的 `context`)。
+  * 按 `sorted_nodes` 的顺序遍历节点。
+  * 对每个节点：
+    * 调用 `_prepare_node_input` 来确定该节点的输入（基于图的初始输入、父节点输出、`input_mapper` 或节点的 `input_declaration`）。
+    * 调用节点的同步 `node.invoke(node_input, internal_graph_context)`。
+  * 收集 `output_nodes` 的结果并返回。
+  * **警告**：如果图中包含 `AsyncRunnable` 节点，并且 `CompiledGraph.invoke()` 是在一个已运行的 `asyncio` 事件循环中被调用的，那么这些 `AsyncRunnable` 节点的 `invoke()` (内部使用 `asyncio.run()`) 会导致 `RuntimeError`。
 * `_internal_invoke_async(self, input_data: Any, context: ExecutionContext) -> Coroutine[Any, Any, Any]`:
-    * **异步执行**整个图的核心逻辑。
-    * 创建一个内部的 `ExecutionContext`。
-    * 按 `sorted_nodes` 的顺序遍历节点。
-    * 对每个节点：
-        * 调用 `_prepare_node_input` (同步方法) 来确定输入。
-        * `await node.invoke_async(node_input, internal_graph_context)`。
-            * 如果节点是同步 `Runnable`，其 `invoke_async` 会在线程池中运行其同步 `invoke`。
-            * 如果节点是 `AsyncRunnable`，其原生的 `invoke_async` 会被执行。
-    * 收集 `output_nodes` 的结果并返回。
+  * **异步执行**整个图的核心逻辑。
+  * 创建一个内部的 `ExecutionContext`。
+  * 按 `sorted_nodes` 的顺序遍历节点。
+  * 对每个节点：
+    * 调用 `_prepare_node_input` (同步方法) 来确定输入。
+    * `await node.invoke_async(node_input, internal_graph_context)`。
+      * 如果节点是同步 `Runnable`，其 `invoke_async` 会在线程池中运行其同步 `invoke`。
+      * 如果节点是 `AsyncRunnable`，其原生的 `invoke_async` 会被执行。
+  * 收集 `output_nodes` 的结果并返回。
 * `invoke_async(self, input_data: Any = NO_INPUT, context: Optional[ExecutionContext] = None) -> Coroutine[Any, Any, Any]`:
-    * `CompiledGraph` 作为 `Runnable` (或应视为 `AsyncRunnable` 行为的实体) 的公共异步接口。
-    * 它会处理顶层图执行的上下文创建，并调用 `self._internal_invoke_async(...)`。
-    * 这是在异步代码中执行包含混合任务类型的图的**推荐方式**。
+  * `CompiledGraph` 作为 `Runnable` (或应视为 `AsyncRunnable` 行为的实体) 的公共异步接口。
+  * 它会处理顶层图执行的上下文创建，并调用 `self._internal_invoke_async(...)`。
+  * 这是在异步代码中执行包含混合任务类型的图的**推荐方式**。
 * `clear_cache(self, cache_name: str = 'all') -> 'CompiledGraph'`:
-    * 清除此编译图自身的缓存，并递归调用其所有内部节点的 `clear_cache` 方法。
+  * 清除此编译图自身的缓存，并递归调用其所有内部节点的 `clear_cache` 方法。
 
 ## 工作流执行的调用约定
 
 为确保正确执行并避免 `RuntimeError`（尤其是在处理异步组件时）：
 
-1.  **从同步上下文调用**：
-    * 如果你的主程序或调用上下文是**同步**的，你可以对任何 `Runnable`（包括 `CompiledGraph` 或由操作符组成的 `Pipeline`）使用其**同步的 `.invoke()`** 方法。
-    * 如果被调用的 `Runnable` 是一个 `AsyncRunnable` (或包含异步组件的 `AsyncPipeline`/`CompiledGraph`)，其 `.invoke()` 方法内部会使用 `asyncio.run()` 来启动一个新的事件循环执行异步逻辑。这在纯同步环境中是安全的。
+1. **从同步上下文调用**：
 
-2.  **从异步上下文调用** (`async def` 函数内)：
-    * 你应该对任何 `Runnable` (特别是 `AsyncRunnable` 的实例、`AsyncPipeline`、`AsyncConditional` 或包含 `AsyncRunnable` 节点的 `CompiledGraph`) 使用其**异步的 `await .invoke_async()`** 方法。
-    * 这会确保异步操作在当前正在运行的事件循环中正确调度和执行。
-    * 对于同步 `Runnable`，其 `invoke_async()` 方法会将其同步逻辑包装到线程池中执行，从而避免阻塞当前事件循环。
-    * **强烈不推荐**在异步上下文中对 `AsyncRunnable` 或包含异步组件的组合器使用同步的 `.invoke()` 方法，因为这会导致 `asyncio.run()` 在已运行的循环中被调用，从而引发 `RuntimeError`。
+   * 如果你的主程序或调用上下文是**同步**的，你可以对任何 `Runnable`（包括 `CompiledGraph` 或由操作符组成的 `Pipeline`）使用其**同步的 `.invoke()`** 方法。
+   * 如果被调用的 `Runnable` 是一个 `AsyncRunnable` (或包含异步组件的 `AsyncPipeline`/`CompiledGraph`)，其 `.invoke()` 方法内部会使用 `asyncio.run()` 来启动一个新的事件循环执行异步逻辑。这在纯同步环境中是安全的。
+2. **从异步上下文调用** (`async def` 函数内)：
+
+   * 你应该对任何 `Runnable` (特别是 `AsyncRunnable` 的实例、`AsyncPipeline`、`AsyncConditional` 或包含 `AsyncRunnable` 节点的 `CompiledGraph`) 使用其**异步的 `await .invoke_async()`** 方法。
+   * 这会确保异步操作在当前正在运行的事件循环中正确调度和执行。
+   * 对于同步 `Runnable`，其 `invoke_async()` 方法会将其同步逻辑包装到线程池中执行，从而避免阻塞当前事件循环。
+   * **强烈不推荐**在异步上下文中对 `AsyncRunnable` 或包含异步组件的组合器使用同步的 `.invoke()` 方法，因为这会导致 `asyncio.run()` 在已运行的循环中被调用，从而引发 `RuntimeError`。
 
 **简而言之**：在 `async def` 中，总是用 `await ...invoke_async()`。在普通 `def` 中，用 `.invoke()`。
 
@@ -464,9 +465,9 @@ TaskPipe 主要设计用于编排具有明确定义的阶段、输入和输出�
 
 在这种情况下，推荐的做法是：
 
-1.  使用专门的库（如 `pynput`, `keyboard` 用于键盘事件，GUI 框架如 `PyQt`, `Tkinter`，或者网络服务器框架如 `FastAPI`, `Flask`）来处理外部事件的监听和初步响应。这些模块通常有自己的事件循环或线程模型。
-2.  当这些外部事件指示一个明确的、可以由 TaskPipe 处理的数据处理阶段开始时（例如，视频录制完成并保存了文件，或者接收到了一个API请求），**由该外部模块触发一个 TaskPipe 工作流**。此时，可以将必要的上下文（如文件路径、请求数据）作为输入传递给 TaskPipe 工作流的 `invoke()` 或 `invoke_async()` 方法。
-3.  TaskPipe 工作流随后负责后续的所有结构化处理步骤（如校验、转换、分析、存储、通知等）。
+1. 使用专门的库（如 `pynput`, `keyboard` 用于键盘事件，GUI 框架如 `PyQt`, `Tkinter`，或者网络服务器框架如 `FastAPI`, `Flask`）来处理外部事件的监听和初步响应。这些模块通常有自己的事件循环或线程模型。
+2. 当这些外部事件指示一个明确的、可以由 TaskPipe 处理的数据处理阶段开始时（例如，视频录制完成并保存了文件，或者接收到了一个API请求），**由该外部模块触发一个 TaskPipe 工作流**。此时，可以将必要的上下文（如文件路径、请求数据）作为输入传递给 TaskPipe 工作流的 `invoke()` 或 `invoke_async()` 方法。
+3. TaskPipe 工作流随后负责后续的所有结构化处理步骤（如校验、转换、分析、存储、通知等）。
 
 这种关注点分离的方法可以保持 TaskPipe 框架的核心功能（任务编排和数据流管理）简洁高效，同时使其能够与事件驱动的系统和应用场景良好集成。
 
@@ -569,3 +570,21 @@ if __name__ == "__main__":
     asyncio.run(main())
 
 ```
+
+### 如何创建自定义 Runnable：
+
+**可以参考 `examples/example.py` 中的示例，或者参考以下步骤：**
+
+**1. 继承 `Runnable` 或 `AsyncRunnable`。**
+
+**2. 实现 `_internal_invoke` 方法（对于同步 `Runnable`）或 `_internal_invoke_async` 方法（对于异步 `AsyncRunnable`）。**
+
+**3. （可选）自定义 `check` 方法或 `_default_check` 方法，以提供自定义的检查逻辑。**
+
+**4. （可选）使用 `input_declaration` 声明输入，以便从 `ExecutionContext` 获取输入数据。**
+
+**5. （可选）自定义 `cache_key_generator`，以提供自定义的缓存键生成逻辑。**
+
+**6. （可选）使用 `on_error` 方法指定错误处理器。**
+
+**7. （可选）使用 `retry` 方法配置重试逻辑。**

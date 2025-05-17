@@ -96,6 +96,6 @@ python -m unittest tests.test_graph
 
 ## API 文档
 
-有关所有类、方法和高级使用模式的全面指南，请参阅 [API\_DOCUMENTATION.md](https://www.google.com/search?q=API_DOCUMENTATION.md)。
+有关所有类、方法和高级使用模式的全面指南，请参阅 [API\_DOCUMENTATION.md](API_DOCUMENTATION.md)。
 
 ```

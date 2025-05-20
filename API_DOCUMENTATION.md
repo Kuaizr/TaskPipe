@@ -34,7 +34,9 @@ classDiagram
         +_check_cache: Dict
         +_custom_check_fn: Optional[Callable]
         +_custom_async_check_fn: Optional[Callable]
-        +_error_handler: Optional[Runnable]
+        +_error_handler: Optional[Union[Runnable, Callable]]
+        +_on_start_handler: Optional[Union[Runnable, Callable]]
+        +_on_complete_handler: Optional[Union[Runnable, Callable]]
         +_retry_config: Optional[Dict]
         +_cache_key_generator: Callable
         +invoke(input_data: Any, context: ExecutionContext) Any
@@ -45,7 +47,12 @@ classDiagram
         +_default_check(data_from_invoke: Any) bool
         +_default_check_async(data_from_invoke: Any) Coroutine
         +set_check(func: Union[Callable, Coroutine]) Runnable
-        +on_error(error_handler_runnable: Runnable) Runnable
+        +on_error(handler: Union[Runnable, Callable]) Runnable
+        +get_error_handler() Optional[Union[Runnable, Callable]]
+        +set_on_start(handler: Union[Runnable, Callable]) Runnable
+        +get_on_start_handler() Optional[Union[Runnable, Callable]]
+        +set_on_complete(handler: Union[Runnable, Callable]) Runnable
+        +get_on_complete_handler() Optional[Union[Runnable, Callable]]
         +retry(max_attempts: int, delay_seconds: Union[int, float], retry_on_exceptions: Union[Type[Exception], Tuple]) Runnable
         +clear_cache(cache_name: str) Runnable
         +copy() Runnable
@@ -209,21 +216,21 @@ classDiagram
 
 **主要属性:**
 
-* `initial_input: Any`: 工作流或当前图执行的初始输入数据。默认为 `NO_INPUT`。
-* `node_outputs: Dict[str, Any]`: 存储已执行节点的输出，键是节点名称。
-* `event_log: List[str]`: 记录工作流执行期间的事件（带时间戳）。
-* `parent_context: Optional['ExecutionContext']`: 指向父执行上下文的引用，主要用于 `CompiledGraph` 内部，以允许图内节点访问图外部的上下文信息。
+- `initial_input: Any`: 工作流或当前图执行的初始输入数据。默认为 `NO_INPUT`。
+- `node_outputs: Dict[str, Any]`: 存储已执行节点的输出，键是节点名称。
+- `event_log: List[str]`: 记录工作流执行期间的事件（带时间戳）。
+- `parent_context: Optional['ExecutionContext']`: 指向父执行上下文的引用，主要用于 `CompiledGraph` 内部，以允许图内节点访问图外部的上下文信息。
 
 **主要方法:**
 
-* `__init__(self, initial_input: Any = NO_INPUT, parent_context: Optional['ExecutionContext'] = None)`: 构造函数。
-* `add_output(self, node_name: str, value: Any)`: 将节点输出添加到 `node_outputs` 中。如果 `node_name` 为空或无效，则仅记录事件。
-* `get_output(self, node_name: str, default: Any = None) -> Any`: 从当前上下文的 `node_outputs` 获取节点输出。如果当前上下文没有找到，并且存在 `parent_context`，则递归地从父上下文获取。
-* `log_event(self, message: str)`: 记录一个带时间戳的事件到 `event_log`。
+- `__init__(self, initial_input: Any = NO_INPUT, parent_context: Optional['ExecutionContext'] = None)`: 构造函数。
+- `add_output(self, node_name: str, value: Any)`: 将节点输出添加到 `node_outputs` 中。如果 `node_name` 为空或无效，则仅记录事件。
+- `get_output(self, node_name: str, default: Any = None) -> Any`: 从当前上下文的 `node_outputs` 获取节点输出。如果当前上下文没有找到，并且存在 `parent_context`，则递归地从父上下文获取。
+- `log_event(self, message: str)`: 记录一个带时间戳的事件到 `event_log`。
 
 **特殊值:**
 
-* `taskpipe.NO_INPUT`: 一个哨兵对象，用于标记 `Runnable` 没有接收到直接的 `input_data` 参数，此时 `Runnable` 通常会尝试从 `ExecutionContext` 或其 `input_declaration` 来解析实际输入。
+- `taskpipe.NO_INPUT`: 一个哨兵对象，用于标记 `Runnable` 没有接收到直接的 `input_data` 参数，此时 `Runnable` 通常会尝试从 `ExecutionContext` 或其 `input_declaration` 来解析实际输入。
 
 ### 2. `taskpipe.Runnable` (ABC)
 
@@ -231,60 +238,71 @@ classDiagram
 
 **主要属性:**
 
-* `name: str`: `Runnable` 实例的名称。如果未提供，则基于类名和对象ID自动生成。
-* `input_declaration: Any`: 定义 `Runnable` 如何从 `ExecutionContext` 获取其输入数据，当 `invoke` 或 `invoke_async` 的 `input_data` 参数为 `NO_INPUT` 时生效。可以是：
-  * 字符串: 从上下文中获取名为该字符串的单个节点输出作为输入。
-  * 字典 (`Dict[str, str]` 或 `Dict[str, Any]`): 将字典的值（通常是上下文中的节点名）映射到字典的键（作为 `_internal_invoke` 的关键字参数）。如果值不是字符串，则直接作为参数值。
-  * 可调用对象 (`Callable[[ExecutionContext], Any]`): 一个函数，接收 `ExecutionContext`，返回实际输入数据。
-* `_invoke_cache: Dict[Any, Any]`: 内部字典，用于缓存 `invoke` 方法的结果。键由 `_cache_key_generator` 生成。
-* `_check_cache: Dict[Any, bool]`: 内部字典，用于缓存 `check` 方法的结果。键是 `data_from_invoke` 序列化后的结果。
-* `_custom_check_fn: Optional[Callable[[Any], bool]]`: 用户定义的同步检查函数。
-* `_custom_async_check_fn: Optional[Callable[[Any], Coroutine[Any, Any, bool]]]` : 用户定义的异步检查协程函数。通过 `set_check` 方法设置。
-* `_error_handler: Optional['Runnable']`: 当此 `Runnable` 执行失败且不重试时，调用的错误处理 `Runnable`。
-* `_retry_config: Optional[Dict[str, Any]]`: 包含重试参数的字典，如 `max_attempts`, `delay_seconds`, `retry_on_exceptions`。
-* `_cache_key_generator: Callable`: 一个函数，用于根据输入数据和上下文生成缓存键。默认为 `_default_cache_key_generator`。**自定义 `cache_key_generator` 时，请务必考虑输入数据、上下文和 `input_declaration`，以确保缓存键的唯一性和有效性。**
+- `name: str`: `Runnable` 实例的名称。如果未提供，则基于类名和对象ID自动生成。
+- `input_declaration: Any`: 定义 `Runnable` 如何从 `ExecutionContext` 获取其输入数据，当 `invoke` 或 `invoke_async` 的 `input_data` 参数为 `NO_INPUT` 时生效。可以是：
+    - 字符串: 从上下文中获取名为该字符串的单个节点输出作为输入。
+    - 字典 (`Dict[str, str]` 或 `Dict[str, Any]`): 将字典的值（通常是上下文中的节点名）映射到字典的键（作为 `_internal_invoke` 的关键字参数）。如果值不是字符串，则直接作为参数值。
+    - 可调用对象 (`Callable[[ExecutionContext], Any]`): 一个函数，接收 `ExecutionContext`，返回实际输入数据。
+- `_invoke_cache: Dict[Any, Any]`: 内部字典，用于缓存 `invoke` 方法的结果。键由 `_cache_key_generator` 生成。
+- `_check_cache: Dict[Any, bool]`: 内部字典，用于缓存 `check` 方法的结果。键是 `data_from_invoke` 序列化后的结果。
+- `_custom_check_fn: Optional[Callable[[Any], bool]]`: 用户定义的同步检查函数。
+- `_custom_async_check_fn: Optional[Callable[[Any], Coroutine[Any, Any, bool]]]` : 用户定义的异步检查协程函数。通过 `set_check` 方法设置。
+- `_error_handler: Optional[Union['Runnable', Callable[[ExecutionContext, Any, Exception], Any]]]`: 当此 `Runnable` 执行失败且不重试时，调用的错误处理器。可以是另一个 `Runnable` 实例或一个可调用函数。
+- `_on_start_handler: Optional[Union['Runnable', Callable[[ExecutionContext, Any], None]]]`: 在 `invoke` 方法开始执行核心逻辑前调用的处理器。可以是 `Runnable` 或可调用函数。
+- `_on_complete_handler: Optional[Union['Runnable', Callable[[ExecutionContext, Any, Optional[Exception]], None]]]`: 在 `invoke` 方法执行完毕（无论成功或失败，在所有重试和错误处理之后）时调用的处理器。可以是 `Runnable` 或可调用函数。
+- `_retry_config: Optional[Dict[str, Any]]`: 包含重试参数的字典，如 `max_attempts`, `delay_seconds`, `retry_on_exceptions`。
+- `_cache_key_generator: Callable`: 一个函数，用于根据输入数据和上下文生成缓存键。默认为 `_default_cache_key_generator`。**自定义 `cache_key_generator` 时，请务必考虑输入数据、上下文和 `input_declaration`，以确保缓存键的唯一性和有效性。**
 
 **主要方法:**
 
-* `__init__(self, name: Optional[str] = None, input_declaration: Any = None, cache_key_generator: Optional[Callable] = None)`: 构造函数。
-* `invoke(self, input_data: Any = NO_INPUT, context: Optional[ExecutionContext] = None) -> Any`:
-  * **同步执行** `Runnable` 的核心公共方法。
-  * 管理执行流程：创建或使用 `ExecutionContext`，解析输入数据 (基于 `input_data` 和 `input_declaration`)，检查缓存，执行重试逻辑，调用 `_internal_invoke`，处理错误，存储缓存和上下文输出。
-  * **重要**: 如果此 `Runnable` 实际上是一个 `AsyncRunnable` 的实例 (如 `AsyncPipeline`)，直接从此方法调用（而不是从其子类的 `_internal_invoke` 中调用 `asyncio.run`）可能不会按预期工作，因为基类 `Runnable.invoke` 未设计为直接启动异步事件循环。`AsyncRunnable` 通过重写 `_internal_invoke` 来桥接同步调用和其异步核心。
-* `_internal_invoke(self, input_data: Any, context: ExecutionContext) -> Any`: (抽象方法) **同步**子类必须实现此方法以定义其核心同步逻辑。对于 `AsyncRunnable`，此方法通常会调用 `asyncio.run(self._internal_invoke_async(...))` 来执行其异步逻辑，但这有一个重要前提：**不能在已运行的 `asyncio` 事件循环中调用 `asyncio.run()`，否则会导致 `RuntimeError`。**
-* `invoke_async(self, input_data: Any = NO_INPUT, context: Optional[ExecutionContext] = None) -> Coroutine[Any, Any, Any]`:
-  * **异步执行** `Runnable` 的核心公共方法。
-  * 对于普通的同步 `Runnable`，此默认实现会将其同步的 `invoke()` 方法包装在 `ThreadPoolExecutor` 中运行，从而允许它在异步流程中非阻塞地执行。
-  * `AsyncRunnable` 子类会重写此方法以提供其原生的异步执行逻辑，通常包括缓存、重试、错误处理，并最终 `await self._internal_invoke_async(...)`。
-* `check(self, data_from_invoke: Any, context: Optional[ExecutionContext] = None) -> bool`:
-  * 对 `invoke` (或 `invoke_async`) 的结果进行验证或条件检查。
-  * 使用 `_custom_check_fn` (如果已设置)，否则调用 `_default_check`。结果会被缓存。
-* `_default_check(self, data_from_invoke: Any) -> bool`: 默认的同步检查逻辑，简单地对 `data_from_invoke` 进行布尔转换。
-* `check_async(self, data_from_invoke: Any, context: Optional[ExecutionContext] = None) -> Coroutine[Any, Any, bool]`:
-  * 异步检查方法。
-  * 如果设置了 `_custom_async_check_fn`，则 `await` 它。
-  * 否则，对于同步 `Runnable`，此默认实现会将其同步的 `check()` 方法包装在 `ThreadPoolExecutor` 中运行。
-  * `AsyncRunnable` 子类会重写此方法（或依赖其 `_custom_async_check_fn` / `_default_check_async`）。
-* `_default_check_async(self, data_from_invoke: Any) -> Coroutine[Any, Any, bool]`:
-  * `Runnable` 基类中的默认异步检查逻辑是简单地对数据进行布尔转换并返回。
-  * `AsyncRunnable` 子类应重写此方法以提供真正的异步检查逻辑。
-* `set_check(self, func: Union[Callable[[Any], bool], Callable[[Any], Coroutine[Any, Any, bool]]]) -> 'Runnable'`:
-  * 允许用户自定义 `check` 方法的逻辑。
-  * 如果 `func` 是一个协程函数 (通过 `asyncio.iscoroutinefunction` 判断)，它将被设置为 `_custom_async_check_fn`，同时 `_custom_check_fn` 会被清除。
-  * 如果 `func` 是一个普通的可调用函数，它将被设置为 `_custom_check_fn`，同时 `_custom_async_check_fn` 会被清除。
-  * 调用此方法会清除 `_check_cache`。
-* `on_error(self, error_handler_runnable: 'Runnable') -> 'Runnable'`: 指定一个 `Runnable` 作为当前任务失败时的错误处理器。
-* `retry(self, max_attempts: int = 3, delay_seconds: Union[int, float] = 1, retry_on_exceptions: Union[Type[Exception], Tuple[Type[Exception], ...]] = (Exception,)) -> 'Runnable'`: 配置当前任务的重试逻辑。
-* `clear_cache(self, cache_name: str = 'all') -> 'Runnable'`: 清除 `_invoke_cache` 和/或 `_check_cache`。
-* `copy(self) -> 'Runnable'`: 创建 `Runnable` 的深拷贝副本，并清除新副本的缓存。
-* `__or__(self, other: Union['Runnable', Dict[str, 'Runnable']]) -> 'Runnable'`:
-  * 操作符 `|` 的实现。
-  * 如果 `other` 是 `Runnable`，通常返回一个 `Pipeline` (或 `AsyncPipeline`，如果任一方是异步的)。
-  * 如果 `other` 是 `Dict[str, Runnable]`，通常先用 `BranchAndFanIn` (或 `AsyncBranchAndFanIn`) 包装 `other`，然后与 `self` 组成 `Pipeline` (或 `AsyncPipeline`)。
-* `__mod__(self, true_branch: 'Runnable') -> '_PendingConditional'`:
-  * 操作符 `%` 的实现，用于条件逻辑的开始。返回一个中间对象 (`_PendingConditional` 或 `_AsyncPendingConditional`)。
-* `_PendingConditional.__rshift__(self, false_r: 'Runnable') -> 'Conditional'`:
-  * 操作符 `>>` 的实现，用于完成条件逻辑的定义，返回一个 `Conditional` (或 `AsyncConditional`) 实例。
+- `__init__(self, name: Optional[str] = None, input_declaration: Any = None, cache_key_generator: Optional[Callable] = None)`: 构造函数。
+- `invoke(self, input_data: Any = NO_INPUT, context: Optional[ExecutionContext] = None) -> Any`:
+    - **同步执行** `Runnable` 的核心公共方法。
+    - 管理执行流程：创建或使用 `ExecutionContext`，调用 `on_start` 钩子，解析输入数据，检查缓存，执行重试逻辑（内部包含 `_internal_invoke` 调用和 `on_error` 处理器逻辑），最后调用 `on_complete` 钩子。
+- `_internal_invoke(self, input_data: Any, context: ExecutionContext) -> Any`: (抽象方法) **同步**子类必须实现此方法以定义其核心同步逻辑。
+- `invoke_async(self, input_data: Any = NO_INPUT, context: Optional[ExecutionContext] = None) -> Coroutine[Any, Any, Any]`:
+    - **异步执行** `Runnable` 的核心公共方法。
+    - 对于普通的同步 `Runnable`，此默认实现会将其同步的 `invoke()` 方法（包括所有新的钩子逻辑）包装在 `ThreadPoolExecutor` 中运行。
+    - `AsyncRunnable` 子类会重写此方法以提供其原生的异步执行逻辑，并应在其实现中集成对异步钩子和异步错误处理器的调用。
+- `check(self, data_from_invoke: Any, context: Optional[ExecutionContext] = None) -> bool`:
+    - 对 `invoke` (或 `invoke_async`) 的结果进行验证或条件检查。
+    - 使用 `_custom_check_fn` (如果已设置)，否则调用 `_default_check`。结果会被缓存。
+- `_default_check(self, data_from_invoke: Any) -> bool`: 默认的同步检查逻辑，简单地对 `data_from_invoke` 进行布尔转换。
+- `check_async(self, data_from_invoke: Any, context: Optional[ExecutionContext] = None) -> Coroutine[Any, Any, bool]`:
+    - 异步检查方法。
+    - 如果设置了 `_custom_async_check_fn`，则 `await` 它。
+    - 否则，对于同步 `Runnable`，此默认实现会将其同步的 `check()` 方法包装在 `ThreadPoolExecutor` 中运行。
+- `_default_check_async(self, data_from_invoke: Any) -> Coroutine[Any, Any, bool]`:
+    - `Runnable` 基类中的默认异步检查逻辑是简单地对数据进行布尔转换并返回。
+    - `AsyncRunnable` 子类应重写此方法以提供真正的异步检查逻辑。
+- `set_check(self, func: Union[Callable[[Any], bool], Callable[[Any], Coroutine[Any, Any, bool]]]) -> 'Runnable'`:
+    - 允许用户自定义 `check` 方法的逻辑。
+    - 如果 `func` 是一个协程函数，它将被设置为 `_custom_async_check_fn`。
+    - 如果 `func` 是一个普通的可调用函数，它将被设置为 `_custom_check_fn`。
+- `on_error(self, handler: Union['Runnable', Callable[[ExecutionContext, Any, Exception], Any]]) -> 'Runnable'`:
+    - 指定一个错误处理器。可以是 `Runnable` 实例或一个可调用函数。
+    - 可调用函数签名: `(context: ExecutionContext, input_data: Any, exception: Exception) -> Any`。其返回值将作为任务的结果。
+    - `Runnable` 处理器将通过 `invoke(input_data, context)` 调用。
+- `get_error_handler(self) -> Optional[Union['Runnable', Callable[[ExecutionContext, Any, Exception], Any]]]`: 返回配置的错误处理器。
+- `set_on_start(self, handler: Union['Runnable', Callable[[ExecutionContext, Any], None]]) -> 'Runnable'`:
+    - 设置一个在任务开始时调用的处理器。
+    - 可调用函数签名: `(context: ExecutionContext, input_data: Any) -> None`。
+    - `Runnable` 处理器将通过 `invoke(input_data, context)` 调用。
+- `get_on_start_handler(self) -> Optional[Union['Runnable', Callable[[ExecutionContext, Any], None]]]`: 返回配置的 on_start 处理器。
+- `set_on_complete(self, handler: Union['Runnable', Callable[[ExecutionContext, Any, Optional[Exception]], None]]) -> 'Runnable'`:
+    - 设置一个在任务完成时（无论成功或失败）调用的处理器。
+    - 可调用函数签名: `(context: ExecutionContext, result: Any, exception: Optional[Exception]) -> None` (其中 `result` 是任务的最终输出，如果发生异常则可能为 `None` 或 `NO_INPUT`；`exception` 是最终的异常对象，如果成功则为 `None`)。
+    - `Runnable` 处理器将通过 `invoke(input_data_to_task, context)` 调用，它可以从上下文中检查最终结果或异常。
+- `get_on_complete_handler(self) -> Optional[Union['Runnable', Callable[[ExecutionContext, Any, Optional[Exception]], None]]]`: 返回配置的 on_complete 处理器。
+- `retry(self, max_attempts: int = 3, delay_seconds: Union[int, float] = 1, retry_on_exceptions: Union[Type[Exception], Tuple[Type[Exception], ...]] = (Exception,)) -> 'Runnable'`: 配置当前任务的重试逻辑。
+- `clear_cache(self, cache_name: str = 'all') -> 'Runnable'`: 清除 `_invoke_cache` 和/或 `_check_cache`。
+- `copy(self) -> 'Runnable'`: 创建 `Runnable` 的深拷贝副本，并清除新副本的缓存。
+- `__or__(self, other: Union['Runnable', Dict[str, 'Runnable']]) -> 'Runnable'`:
+    - 操作符 `|` 的实现。
+- `__mod__(self, true_branch: 'Runnable') -> '_PendingConditional'`:
+    - 操作符 `%` 的实现，用于条件逻辑的开始。
+- `_PendingConditional.__rshift__(self, false_r: 'Runnable') -> 'Conditional'`:
+    - 操作符 `>>` 的实现，用于完成条件逻辑的定义。
 
 ### 3. `taskpipe.async_runnables.AsyncRunnable` (ABC)
 

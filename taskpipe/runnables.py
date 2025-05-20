@@ -19,16 +19,13 @@ class ExecutionContext:
     一个在工作流执行期间携带状态和节点输出的对象。
     """
     def __init__(self, initial_input: Any = NO_INPUT, parent_context: Optional['ExecutionContext'] = None):
-        # logger.debug(f"DEBUG_CONTEXT_INIT: ExecutionContext {id(self)} CREATED. Initial input type: {type(initial_input).__name__}. Parent context ID: {id(parent_context) if parent_context else 'None'}")
         self.node_outputs: Dict[str, Any] = {}
         self.initial_input: Any = initial_input
         self.event_log: List[str] = []
-        self.parent_context: Optional['ExecutionContext'] = parent_context # 用于图的嵌套上下文
-        # logger.debug(f"DEBUG: ExecutionContext {id(self)} created. Parent: {id(parent_context) if parent_context else None}") # Debug print
+        self.parent_context: Optional['ExecutionContext'] = parent_context
 
     def add_output(self, node_name: str, value: Any):
         """将节点输出添加到上下文中。"""
-        # logger.debug(f"DEBUG: ExecutionContext {id(self)}: Adding output for node '{node_name}'. Value: {str(value)[:60]}...") # Debug print
         if node_name:
             self.node_outputs[node_name] = value
             self.log_event(f"Output added for node '{node_name}'. Value type: {type(value).__name__}")
@@ -40,20 +37,17 @@ class ExecutionContext:
         从上下文中获取节点输出。
         如果当前上下文没有，且存在父上下文，则尝试从父上下文获取。
         """
-        logger.debug(f"DEBUG: ExecutionContext {id(self)}: Getting output for '{node_name}'. Current outputs: {list(self.node_outputs.keys())}") # Debug print
         if node_name in self.node_outputs:
             return self.node_outputs[node_name]
         if self.parent_context:
-            # logger.debug(f"Context '{id(self)}': Node '{node_name}' not in current context, trying parent context '{id(self.parent_context)}'.")
             return self.parent_context.get_output(node_name, default)
-        # logger.debug(f"Context '{id(self)}': Node '{node_name}' not found in current or parent contexts.")
         return default
 
     def log_event(self, message: str):
         """记录一个事件到事件日志。"""
         timestamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
         full_message = f"[{timestamp}] {message}"
-        logger.debug(f"ContextEvent: {message}") # 使用 debug级别以减少默认输出
+        logger.debug(f"ContextEvent: {message}")
         self.event_log.append(full_message)
 
     def __repr__(self) -> str:
@@ -65,10 +59,7 @@ def _default_cache_key_generator(runnable_name: str, input_data: Any, context: O
     尝试序列化输入数据和从上下文中根据 input_declaration 获取的相关数据。
     """
     try:
-        # 1. 直接输入数据
         input_data_bytes = pickle.dumps(input_data)
-
-        # 2. 从上下文中获取的声明式输入
         declared_inputs_tuple = None
         if context and input_declaration:
             relevant_context_outputs = {}
@@ -79,35 +70,24 @@ def _default_cache_key_generator(runnable_name: str, input_data: Any, context: O
                     if isinstance(source_name, str):
                         relevant_context_outputs[key] = context.get_output(source_name)
             elif callable(input_declaration):
-                 # For callable declaration, we might need to hash the function itself or its source,
-                 # and potentially the context values it *would* use. This is complex.
-                 # For simplicity, if declaration is callable, we might just include the declaration object itself
-                 # or skip context-based hashing for this case. Let's include the declaration object for now.
-                 relevant_context_outputs["_declaration_callable"] = input_declaration # Not ideal for hashing
+                 relevant_context_outputs["_declaration_callable"] = input_declaration
             
-            # Convert to a hashable format
-            # Handle potential unhashable values within relevant_context_outputs
             hashable_context_items = []
             for k, v in sorted(relevant_context_outputs.items()):
                  try:
                       hashable_context_items.append((k, pickle.dumps(v)))
                  except Exception:
-                      # If value is not picklable, use its string representation and type as a fallback hash component
                       hashable_context_items.append((k, str(v) + type(v).__name__))
-
             declared_inputs_tuple = tuple(hashable_context_items)
-
         declared_inputs_bytes = pickle.dumps(declared_inputs_tuple)
 
-        # Combine and hash
         hasher = hashlib.md5()
         hasher.update(input_data_bytes)
         hasher.update(declared_inputs_bytes)
-        hasher.update(runnable_name.encode('utf-8')) # Ensure name is bytes
+        hasher.update(runnable_name.encode('utf-8'))
         return hasher.hexdigest()
-    except Exception as e: # pickle or other error during key generation
-        # logger.warning(f"Cache key generation failed for {runnable_name} with error: {e}. Using object() as key (cache disabled for this call).", exc_info=True)
-        return object() # Return a unique object, effectively disabling cache for this specific call
+    except Exception as e:
+        return object()
 
 
 class Runnable(abc.ABC):
@@ -115,32 +95,81 @@ class Runnable(abc.ABC):
     系统的基本构建块。每个 Runnable 代表工作流中的一个操作或步骤。
     """
     def __init__(self, name: Optional[str] = None, input_declaration: Any = None, cache_key_generator: Optional[Callable[[str, Any, Optional[ExecutionContext], Any], Any]] = None):
-        # Ensure name is always a non-empty string
         self.name: str = name if name else f"{self.__class__.__name__}_{id(self)}"
         if not isinstance(self.name, str) or not self.name:
-             self.name = f"{self.__class__.__name__}_{id(self)}" # Fallback if provided name is invalid
+             self.name = f"{self.__class__.__name__}_{id(self)}"
 
         self._invoke_cache: Dict[Any, Any] = {}
         self._check_cache: Dict[Any, bool] = {}
-        self._custom_check_fn: Optional[Callable[[Any], bool]] = None # Sync custom check
-        self._custom_async_check_fn: Optional[Callable[[Any], Coroutine[Any, Any, bool]]] = None # Async custom check
+        self._custom_check_fn: Optional[Callable[[Any], bool]] = None
+        self._custom_async_check_fn: Optional[Callable[[Any], Coroutine[Any, Any, bool]]] = None
 
-        self._error_handler: Optional['Runnable'] = None
+        # Modified: _error_handler can now be Runnable or Callable
+        self._error_handler: Optional[Union['Runnable', Callable[[ExecutionContext, Any, Exception], Any]]] = None
         self._retry_config: Optional[Dict[str, Any]] = None
         self.input_declaration: Any = input_declaration
-# TODO: Add documentation on how to create a custom cache_key_generator.
-        # Explain the importance of considering the input data, context, and input_declaration when generating the cache key.
-        # Also, consider adding a "How to create a custom Runnable" section to the documentation,
-        # providing best practices and examples.
         self._cache_key_generator = cache_key_generator or _default_cache_key_generator
+
+        # New lifecycle hook handlers
+        self._on_start_handler: Optional[Union['Runnable', Callable[[ExecutionContext, Any], None]]] = None
+        self._on_complete_handler: Optional[Union['Runnable', Callable[[ExecutionContext, Any, Optional[Exception]], None]]] = None
 
     def _get_cache_key(self, input_data: Any, context: Optional[ExecutionContext]) -> Any:
         return self._cache_key_generator(self.name, input_data, context, self.input_declaration)
 
+    # --- Lifecycle Hook Setter Methods ---
+    def set_on_start(self, handler: Union['Runnable', Callable[[ExecutionContext, Any], None]]) -> 'Runnable':
+        """
+        Sets a handler to be called at the start of the invoke method.
+        The handler can be a Runnable or a callable.
+        Callable signature: (context: ExecutionContext, input_data: Any) -> None
+        Runnable handler will be invoked with (input_data, context).
+        """
+        if not isinstance(handler, Runnable) and not callable(handler):
+            raise TypeError("on_start handler must be a Runnable instance or a callable.")
+        self._on_start_handler = handler
+        return self
+
+    def get_on_start_handler(self) -> Optional[Union['Runnable', Callable[[ExecutionContext, Any], None]]]:
+        """Returns the configured on_start handler."""
+        return self._on_start_handler
+
+    def set_on_complete(self, handler: Union['Runnable', Callable[[ExecutionContext, Any, Optional[Exception]], None]]) -> 'Runnable':
+        """
+        Sets a handler to be called at the completion of the invoke method.
+        The handler can be a Runnable or a callable.
+        Callable signature: (context: ExecutionContext, result: Any, exception: Optional[Exception]) -> None
+        Runnable handler will be invoked with (input_data_to_task, context). The context can be inspected for output.
+        """
+        if not isinstance(handler, Runnable) and not callable(handler):
+            raise TypeError("on_complete handler must be a Runnable instance or a callable.")
+        self._on_complete_handler = handler
+        return self
+
+    def get_on_complete_handler(self) -> Optional[Union['Runnable', Callable[[ExecutionContext, Any, Optional[Exception]], None]]]:
+        """Returns the configured on_complete handler."""
+        return self._on_complete_handler
+
+    # Modified on_error to accept Runnable or Callable
+    def on_error(self, handler: Union['Runnable', Callable[[ExecutionContext, Any, Exception], Any]]) -> 'Runnable':
+        """
+        Specifies an error handler for the current task.
+        The handler can be a Runnable or a callable.
+        Callable signature: (context: ExecutionContext, input_data: Any, exception: Exception) -> Any
+        Runnable handler will be invoked with (input_data, context).
+        The return value of the handler will be the result of this task if the handler executes successfully.
+        """
+        if not isinstance(handler, Runnable) and not callable(handler):
+            raise TypeError("Error handler must be a Runnable instance or a callable.")
+        self._error_handler = handler # Existing attribute, now with updated type
+        return self
+
+    def get_error_handler(self) -> Optional[Union['Runnable', Callable[[ExecutionContext, Any, Exception], Any]]]:
+        """Returns the configured error handler."""
+        return self._error_handler
+    
     def invoke(self, input_data: Any = NO_INPUT, context: Optional[ExecutionContext] = None) -> Any:
-        # logger.debug(f"DEBUG: Runnable '{self.name}' invoke called. Input type: {type(input_data).__name__}. Passed Context ID: {id(context)}") # Debug print
         effective_context = context if context is not None else ExecutionContext(initial_input=input_data if input_data is not NO_INPUT else None)
-        # logger.debug(f"DEBUG: Runnable '{self.name}' using effective_context ID: {id(effective_context)}") # Debug print
         
         actual_input_for_invoke = input_data
         if self.input_declaration and input_data is NO_INPUT and effective_context:
@@ -157,83 +186,132 @@ class Runnable(abc.ABC):
             elif callable(self.input_declaration): 
                 actual_input_for_invoke = self.input_declaration(effective_context)
 
-        cache_key = self._get_cache_key(actual_input_for_invoke, effective_context)
+        task_final_result: Any = NO_INPUT
+        task_final_exception: Optional[Exception] = None
 
-        if cache_key in self._invoke_cache:
-            effective_context.log_event(f"Node '{self.name}': Invoke result from cache.")
-            result = self._invoke_cache[cache_key]
-            if self.name and effective_context: 
-                effective_context.add_output(self.name, result)
-            return result
-
-        current_attempt = 0
-        max_attempts = (self._retry_config or {}).get("max_attempts", 1)
-        delay_seconds = (self._retry_config or {}).get("delay_seconds", 0)
-        retry_on_exceptions = (self._retry_config or {}).get("retry_on_exceptions", (Exception,)) 
-
-        while current_attempt < max_attempts:
-            current_attempt += 1
-            effective_context.log_event(f"Node '{self.name}': Invoking (Attempt {current_attempt}/{max_attempts}). Input type: {type(actual_input_for_invoke).__name__}")
-
+        # 1. Execute on_start handler
+        if self._on_start_handler:
             try:
-                result = self._internal_invoke(actual_input_for_invoke, effective_context)
+                effective_context.log_event(f"Node '{self.name}': Executing on_start handler.")
+                if isinstance(self._on_start_handler, Runnable):
+                    self._on_start_handler.invoke(actual_input_for_invoke, effective_context)
+                elif callable(self._on_start_handler):
+                    self._on_start_handler(effective_context, actual_input_for_invoke)
+            except Exception as e_start_hook:
+                effective_context.log_event(f"Node '{self.name}': Error in on_start handler: {type(e_start_hook).__name__}: {e_start_hook}. Task execution will be skipped.")
+                task_final_exception = e_start_hook
+                # Skip to on_complete if on_start fails
+
+        # 2. Main task execution (only if on_start did not fail)
+        if task_final_exception is None:
+            cache_key = self._get_cache_key(actual_input_for_invoke, effective_context)
+            if cache_key in self._invoke_cache:
+                effective_context.log_event(f"Node '{self.name}': Invoke result from cache.")
+                task_final_result = self._invoke_cache[cache_key]
+                if self.name: # Add to context even if from cache
+                    effective_context.add_output(self.name, task_final_result)
+            else:
+                current_attempt = 0
+                max_attempts = (self._retry_config or {}).get("max_attempts", 1)
+                delay_seconds = (self._retry_config or {}).get("delay_seconds", 0)
+                retry_on_exceptions = (self._retry_config or {}).get("retry_on_exceptions", (Exception,)) 
+
+                while current_attempt < max_attempts:
+                    current_attempt += 1
+                    effective_context.log_event(f"Node '{self.name}': Invoking (Attempt {current_attempt}/{max_attempts}). Input type: {type(actual_input_for_invoke).__name__}")
+                    
+                    try:
+                        result_internal = self._internal_invoke(actual_input_for_invoke, effective_context)
+                        task_final_result = result_internal
+                        task_final_exception = None # Clear any prior attempt's exception
+                        
+                        self._invoke_cache[cache_key] = task_final_result
+                        effective_context.log_event(f"Node '{self.name}': Invoked successfully. Output type: {type(task_final_result).__name__}.")
+                        if self.name:
+                            effective_context.add_output(self.name, task_final_result)
+                        break # Success, exit retry loop
+
+                    except Exception as e_internal:
+                        effective_context.log_event(f"Node '{self.name}': Error during invoke (Attempt {current_attempt}/{max_attempts}): {type(e_internal).__name__}: {e_internal}")
+                        task_final_exception = e_internal # Store current exception
+
+                        is_retryable_exception_type = isinstance(e_internal, retry_on_exceptions)
+                        is_last_attempt = (current_attempt == max_attempts)
+
+                        if not is_retryable_exception_type or is_last_attempt:
+                            if self._error_handler:
+                                effective_context.log_event(f"Node '{self.name}': Attempting to execute on_error handler.")
+                                try:
+                                    error_handler_output: Any
+                                    if isinstance(self._error_handler, Runnable):
+                                        error_handler_output = self._error_handler.invoke(actual_input_for_invoke, effective_context)
+                                    elif callable(self._error_handler): # It's a callable
+                                        error_handler_output = self._error_handler(effective_context, actual_input_for_invoke, e_internal)
+                                    
+                                    task_final_result = error_handler_output
+                                    task_final_exception = None # Error was handled, clear exception
+                                    
+                                    self._invoke_cache[cache_key] = task_final_result # Cache result from error handler
+                                    effective_context.log_event(f"Node '{self.name}': on_error handler executed successfully.")
+                                    if self.name: # Add error handler's output to context
+                                        effective_context.add_output(self.name, task_final_result)
+
+                                except Exception as e_error_handler:
+                                    effective_context.log_event(f"Node '{self.name}': on_error handler also failed: {type(e_error_handler).__name__}: {e_error_handler}")
+                                    task_final_exception = e_error_handler # Error handler failed, this is the new exception
+                                # break from retry loop whether error handler succeeded or failed, as this was the final attempt for main logic
+                                break 
+                            else:
+                                # No error handler, and not retryable or last attempt, so exception remains
+                                break # Exit retry loop, task_final_exception is set
+                        
+                        # If retryable and not last attempt
+                        effective_context.log_event(f"Node '{self.name}': Retrying in {delay_seconds} seconds.")
+                        if delay_seconds > 0: # Ensure no sleep if delay is zero or negative
+                            time.sleep(delay_seconds)
                 
-                self._invoke_cache[cache_key] = result
-                effective_context.log_event(f"Node '{self.name}': Invoked successfully. Output type: {type(result).__name__}.")
+                # If loop finished and task_final_exception is still from the last attempt without being handled
+                # (e.g. no error handler, or retryable exception on last attempt) it remains stored.
+                # If task succeeded, task_final_result is set and task_final_exception is None.
 
-                if self.name:
-                    effective_context.add_output(self.name, result)
+        # 3. Execute on_complete handler
+        if self._on_complete_handler:
+            try:
+                effective_context.log_event(f"Node '{self.name}': Executing on_complete handler.")
+                # Prepare result for callable: use None if NO_INPUT and there's an exception
+                result_for_callable = None
+                if task_final_result is not NO_INPUT:
+                    result_for_callable = task_final_result
                 
-                return result
+                if isinstance(self._on_complete_handler, Runnable):
+                    self._on_complete_handler.invoke(actual_input_for_invoke, effective_context)
+                elif callable(self._on_complete_handler):
+                    self._on_complete_handler(effective_context, result_for_callable, task_final_exception)
+            except Exception as e_complete_hook:
+                effective_context.log_event(f"Node '{self.name}': Error in on_complete handler: {type(e_complete_hook).__name__}: {e_complete_hook}. This error is logged but does not alter task outcome.")
+                # Optionally, this error could be aggregated or replace task_final_exception if needed,
+                # but current design is to log and not let on_complete failure obscure original task outcome.
 
-            except Exception as e:
-                effective_context.log_event(f"Node '{self.name}': Error during invoke (Attempt {current_attempt}/{max_attempts}): {type(e).__name__}: {e}")
-
-                is_retryable = isinstance(e, retry_on_exceptions)
-                is_last_attempt = (current_attempt == max_attempts)
-
-                if not is_retryable or is_last_attempt:
-                    if self._error_handler:
-                        effective_context.log_event(f"Node '{self.name}': Invoking error handler '{self._error_handler.name}'.")
-                        try:
-                            error_handler_output = self._error_handler.invoke(actual_input_for_invoke, effective_context)
-                            effective_context.log_event(f"Node '{self.name}': Error handler '{self._error_handler.name}' executed.")
-                            if self.name:
-                                effective_context.add_output(self.name, error_handler_output)
-                            self._invoke_cache[cache_key] = error_handler_output 
-                            return error_handler_output 
-                        except Exception as eh_e:
-                            effective_context.log_event(f"Node '{self.name}': Error handler '{self._error_handler.name}' also failed: {type(eh_e).__name__}: {eh_e}")
-                            raise e from eh_e 
-
-                    else:
-                        raise e 
-            
-                effective_context.log_event(f"Node '{self.name}': Retrying in {delay_seconds} seconds.")
-                time.sleep(delay_seconds)
+        # 4. Determine final outcome
+        if task_final_exception is not None:
+            raise task_final_exception
         
-        # Should not be reached if max_attempts >=1
-        # Re-raise the last exception if loop finishes without returning
-        if 'e' in locals(): # Check if exception 'e' was defined
-            raise e
-        else: # Should ideally not happen if loop was entered
-            raise RuntimeError(f"Runnable '{self.name}': Exited retry loop unexpectedly without an exception or return.")
-
+        # If task_final_result is still NO_INPUT (e.g. _internal_invoke returned NO_INPUT, or no execution path set it)
+        # and no exception, then NO_INPUT is the valid result.
+        return task_final_result
 
     @abc.abstractmethod
     def _internal_invoke(self, input_data: Any, context: ExecutionContext) -> Any:
         pass
 
     async def invoke_async(self, input_data: Any = NO_INPUT, context: Optional[ExecutionContext] = None) -> Any:
-        """
-        Default asynchronous invocation for a Runnable.
-        Runs the synchronous invoke method in a thread pool executor.
-        Subclasses (like AsyncRunnable) should override this for native async behavior.
-        """
         # logger.debug(f"Runnable '{self.name}': Default invoke_async, running sync invoke in executor.")
         loop = asyncio.get_event_loop()
-        # The synchronous self.invoke already handles context creation, input declaration,
-        # caching, retries, and error handling.
+        # NOTE: For full async support of these new lifecycle hooks,
+        # AsyncRunnable.invoke_async would need its own implementation
+        # that calls await on async handlers and invoke_async on Runnable handlers.
+        # This default implementation will run the entire modified sync invoke (with sync hooks)
+        # in a thread pool executor.
         return await loop.run_in_executor(None, self.invoke, input_data, context)
 
     def check(self, data_from_invoke: Any, context: Optional[ExecutionContext] = None) -> bool:
@@ -260,59 +338,27 @@ class Runnable(abc.ABC):
         return bool(data_from_invoke)
 
     async def check_async(self, data_from_invoke: Any, context: Optional[ExecutionContext] = None) -> bool:
-        """
-        Default asynchronous check for a Runnable.
-        Runs the synchronous check method in a thread pool executor.
-        Subclasses (like AsyncRunnable) should override this for native async behavior.
-        """
         # logger.debug(f"Runnable '{self.name}': Default check_async, running sync check in executor.")
-        
-        # Async custom check function takes precedence if available
         if self._custom_async_check_fn:
-            # logger.debug(f"Runnable '{self.name}': Using async custom check function for check_async.")
-            # Logic for caching async check results would be needed here if we don't go through sync `check`
-            # For simplicity now, let's assume custom_async_check_fn bypasses the standard cache, or handles its own.
-            # Or, we can try to integrate it with the existing _check_cache if keys are compatible.
-            # This default implementation below prioritizes the sync path if no _custom_async_check_fn exists.
             return await self._custom_async_check_fn(data_from_invoke)
-
-        # Fallback to running the synchronous check method in an executor
         loop = asyncio.get_event_loop()
-        # The synchronous self.check already handles caching logic.
         return await loop.run_in_executor(None, self.check, data_from_invoke, context)
 
     async def _default_check_async(self, data_from_invoke: Any) -> bool:
-        """
-        Default asynchronous check logic. AsyncRunnables will override this.
-        For base Runnable, it's essentially bool(data).
-        """
         return bool(data_from_invoke)
 
-
     def set_check(self, func: Union[Callable[[Any], bool], Callable[[Any], Coroutine[Any, Any, bool]]]):
-        """
-        允许用户自定义 check 方法的逻辑。
-        If func is a coroutine function, it's set as the async check.
-        If func is a regular function, it's set as the sync check.
-        """
         if asyncio.iscoroutinefunction(func):
             self._custom_async_check_fn = func
-            self._custom_check_fn = None # Clear sync if async is set
-            # logger.debug(f"Runnable '{self.name}': Custom ASYNC check function set.")
+            self._custom_check_fn = None 
         elif callable(func):
             self._custom_check_fn = func
-            self._custom_async_check_fn = None # Clear async if sync is set
-            # logger.debug(f"Runnable '{self.name}': Custom SYNC check function set.")
+            self._custom_async_check_fn = None 
         else:
             raise TypeError("Custom check function must be callable or a coroutine function.")
         self.clear_cache('_check_cache')
         return self
 
-    def on_error(self, error_handler_runnable: 'Runnable'):
-        if not isinstance(error_handler_runnable, Runnable):
-            raise TypeError("Error handler must be a Runnable instance.")
-        self._error_handler = error_handler_runnable
-        return self
 
     def retry(self, max_attempts: int = 3, delay_seconds: Union[int, float] = 1, retry_on_exceptions: Union[Type[Exception], Tuple[Type[Exception], ...]] = (Exception,)):
         if not isinstance(max_attempts, int) or max_attempts < 1:
@@ -342,9 +388,6 @@ class Runnable(abc.ABC):
         return self
 
     def __or__(self, other: Union['Runnable', Dict[str, 'Runnable']]) -> 'Runnable':
-        return NotImplemented
-
-    def __or__(self, other: Union['Runnable', Dict[str, 'Runnable']]) -> 'Runnable':
         # This version of __or__ will always create a synchronous Pipeline/BranchAndFanIn.
         # AsyncRunnable will override __or__ and __ror__ to create AsyncPipeline.
         if isinstance(other, Runnable):
@@ -355,8 +398,6 @@ class Runnable(abc.ABC):
         return NotImplemented
 
     def __mod__(self, true_branch: 'Runnable') -> '_PendingConditional':
-        # This version creates a synchronous _PendingConditional.
-        # AsyncRunnable will override __mod__ for _AsyncPendingConditional.
         if not isinstance(true_branch, Runnable):
             return NotImplemented
         return _PendingConditional(self, true_branch)

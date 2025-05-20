@@ -227,12 +227,6 @@ class AsyncRunnable(Runnable):
             return AsyncPipeline(other, self)
         return NotImplemented
 
-    def __ror__(self, other: Runnable) -> 'AsyncPipeline':
-        # Handles: sync_runnable | async_runnable
-        # If other is a Runnable (sync or async) and self is AsyncRunnable,
-        # the result should be an AsyncPipeline.
-        return AsyncPipeline(other, self)
-
     def __mod__(self, true_branch: Runnable) -> '_AsyncPendingConditional': # Always return _AsyncPendingConditional
         if not isinstance(true_branch, Runnable):
             return NotImplemented

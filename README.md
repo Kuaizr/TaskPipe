@@ -16,7 +16,12 @@ TaskPipe 是一个 Python 框架，用于构建、组合和执行复杂的工作
     * `SourceParallel({"branch1": task_a, "branch2": task_b})`: 从共同的（或无）输入并行运行多个任务或流水线。
 * **执行上下文 (`ExecutionContext`)**: 一个共享的 `ExecutionContext` 对象在工作流执行期间流动，允许任务之间共享数据、访问先前执行任务的输出，并记录事件。
 * **缓存**: 内置支持对 `Runnable` 的 `invoke`/`invoke_async` 和 `check`/`check_async` 方法的结果进行缓存，以加速重复执行和条件判断。
-* **错误处理与重试**: 可以为每个 `Runnable` 配置错误处理器 (另一个 `Runnable`) 和重试机制 (包括尝试次数、延迟、特定异常类型)。
+* **错误处理与重试**:
+    * 可以为每个 `Runnable` 配置错误处理器和重试机制。
+    * `on_error` 方法现在更加灵活，不仅可以接受一个 `Runnable`作为错误处理器，还可以接受一个普通的可调用函数（例如 lambda 或自定义函数），使得轻量级的错误处理更为便捷。
+* **生命周期钩子**:
+    * 新增 `on_start` 和 `on_complete` 生命周期钩子，允许用户在任务执行的关键阶段（开始前和完成后）注入自定义逻辑。
+    * 这些钩子（包括增强后的 `on_error`）都可以接受 `Runnable` 实例或普通可调用函数作为处理器，为日志记录、资源管理、监控和通知等场景提供了极大的灵活性。
 * **基于图的定义 (可选)**: 对于更复杂或需要集中管理的工作流，可以使用 `WorkflowGraph` 以声明方式定义节点和边，然后将其编译为可执行的 `CompiledGraph`。`CompiledGraph` 同样支持同步和异步执行。**需要注意的是，当一个包含异步节点的 `CompiledGraph` 通过其同步方法 `compiled_graph.invoke()` 执行时，图中的每个异步节点会通过 `AsyncRunnable._internal_invoke -> asyncio.run()` 的路径被依次、同步地执行，这会失去这些异步节点之间潜在的并发性。通过 `await compiled_graph.invoke_async()` 执行时，则能很好地利用 `asyncio` 的并发能力。**
 * **可扩展性**: 用户可以轻松创建自己的、继承自 `Runnable` 或 `AsyncRunnable` 的自定义任务类型，以封装特定的业务逻辑。
 * **明确的调用约定**:

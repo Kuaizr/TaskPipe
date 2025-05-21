@@ -24,12 +24,12 @@ class AsyncRunnable(Runnable):
     
     # __init__ is inherited from Runnable
 
-    async def invoke_async(self, input_data: Any = NO_INPUT, 
-                         context: Optional[ExecutionContext] = None) -> Any:
-        """Asynchronous invoke method. Handles input declaration, caching, retries, and error handling."""
+    async def invoke_async(self, input_data: Any = NO_INPUT,
+                           context: Optional[ExecutionContext] = None) -> Any:
+        """Asynchronous invoke method. Handles input declaration, caching (respecting use_cache), retries, and error handling."""
         effective_context = context if context is not None else ExecutionContext(
             initial_input=input_data if input_data is not NO_INPUT else None)
-            
+
         actual_input_for_invoke = input_data
         if self.input_declaration and input_data is NO_INPUT and effective_context:
             if isinstance(self.input_declaration, str):
@@ -43,26 +43,31 @@ class AsyncRunnable(Runnable):
                         kwargs_from_context[param_name] = source_key
                 actual_input_for_invoke = kwargs_from_context
             elif callable(self.input_declaration):
-                # If declaration is async callable, await it, else call directly
                 if asyncio.iscoroutinefunction(self.input_declaration):
                     actual_input_for_invoke = await self.input_declaration(effective_context)
                 else:
                     actual_input_for_invoke = self.input_declaration(effective_context)
 
-
-        cache_key = self._get_cache_key(actual_input_for_invoke, effective_context)
+        cache_key = None # Initialize
+        if self.use_cache:
+            cache_key = self._get_cache_key(actual_input_for_invoke, effective_context)
+            if cache_key in self._invoke_cache:
+                effective_context.log_event(f"Node '{self.name}': Async invoke result from cache.")
+                result = self._invoke_cache[cache_key]
+                if self.name and effective_context: # Ensure effective_context is not None (it won't be here)
+                    effective_context.add_output(self.name, result)
+                return result
         
-        if cache_key in self._invoke_cache:
-            effective_context.log_event(f"Node '{self.name}': Async invoke result from cache.")
-            result = self._invoke_cache[cache_key]
-            if self.name and effective_context:
-                effective_context.add_output(self.name, result)
-            return result
+        if not self.use_cache: # Log if caching is disabled
+            effective_context.log_event(f"Node '{self.name}': Async caching disabled (use_cache=False).")
+
 
         current_attempt = 0
         max_attempts = (self._retry_config or {}).get("max_attempts", 1)
         delay_seconds = (self._retry_config or {}).get("delay_seconds", 0)
         retry_on_exceptions = (self._retry_config or {}).get("retry_on_exceptions", (Exception,))
+        
+        last_exception: Optional[Exception] = None # Store the last exception for re-raising
 
         while current_attempt < max_attempts:
             current_attempt += 1
@@ -72,7 +77,8 @@ class AsyncRunnable(Runnable):
 
             try:
                 result = await self._internal_invoke_async(actual_input_for_invoke, effective_context)
-                self._invoke_cache[cache_key] = result
+                if self.use_cache and cache_key is not None: 
+                    self._invoke_cache[cache_key] = result
                 effective_context.log_event(
                     f"Node '{self.name}': Async invoked successfully. "
                     f"Output type: {type(result).__name__}.")
@@ -82,6 +88,7 @@ class AsyncRunnable(Runnable):
                 return result
 
             except Exception as e:
+                last_exception = e # Store the current exception
                 effective_context.log_event(
                     f"Node '{self.name}': Error during async invoke "
                     f"(Attempt {current_attempt}/{max_attempts}): "
@@ -91,70 +98,75 @@ class AsyncRunnable(Runnable):
                 is_last_attempt = (current_attempt == max_attempts)
 
                 if not is_retryable or is_last_attempt:
-                    if self._error_handler:
+                    if self._error_handler: # Assumes _error_handler is Runnable for invoke_async
                         effective_context.log_event(
                             f"Node '{self.name}': Invoking async error handler "
-                            f"'{self._error_handler.name}'.")
+                            f"'{getattr(self._error_handler, 'name', 'UnnamedErrorHandler')}'.") # Use getattr for name
                         try:
-                            # Error handler should also be invoked asynchronously
-                            error_handler_output = await self._error_handler.invoke_async(
-                                actual_input_for_invoke, effective_context)
-                            effective_context.log_event(
-                                f"Node '{self.name}': Async error handler "
-                                f"'{self._error_handler.name}' executed.")
-                            if self.name:
-                                effective_context.add_output(self.name, error_handler_output)
-                            self._invoke_cache[cache_key] = error_handler_output
-                            return error_handler_output
+                            if isinstance(self._error_handler, Runnable): # Check if it's a Runnable
+                                error_handler_output = await self._error_handler.invoke_async(
+                                    actual_input_for_invoke, effective_context)
+                                effective_context.log_event(
+                                    f"Node '{self.name}': Async error handler "
+                                    f"'{getattr(self._error_handler, 'name', 'UnnamedErrorHandler')}' executed.")
+                                if self.name:
+                                    effective_context.add_output(self.name, error_handler_output)
+                                if self.use_cache and cache_key is not None: # <<< MODIFIED: Check use_cache
+                                    self._invoke_cache[cache_key] = error_handler_output
+                                return error_handler_output
+                            else:
+                                effective_context.log_event(f"Node '{self.name}': Error handler is not a Runnable, cannot invoke_async. Raising original error.")
+                                raise e # Re-raise original error if handler is not Runnable
                         except Exception as eh_e:
                             effective_context.log_event(
                                 f"Node '{self.name}': Async error handler "
-                                f"'{self._error_handler.name}' also failed: "
+                                f"'{getattr(self._error_handler, 'name', 'UnnamedErrorHandler')}' also failed: "
                                 f"{type(eh_e).__name__}: {eh_e}")
-                            raise e from eh_e
-                    raise e
+                            raise e from eh_e # Re-raise original error, with error handler's error as context
+                    raise e # Re-raise original error if no error_handler or if it wasn't a Runnable
                 
                 effective_context.log_event(
                     f"Node '{self.name}': Async retrying in {delay_seconds} seconds.")
-                await asyncio.sleep(delay_seconds)
+                if delay_seconds > 0: # Ensure no sleep if delay is zero
+                    await asyncio.sleep(delay_seconds)
         
-        # Should not be reached if max_attempts >=1
-        if 'e' in locals():
-            raise e
+        # This part is reached if all retry attempts fail and the last exception was not handled or re-raised
+        if last_exception is not None:
+            raise last_exception
         else:
-            raise RuntimeError(f"AsyncRunnable '{self.name}': Exited retry loop unexpectedly.")
+            raise RuntimeError(f"AsyncRunnable '{self.name}': Exited retry loop unexpectedly without result or exception.")
 
 
-    async def check_async(self, data_from_invoke: Any, 
-                         context: Optional[ExecutionContext] = None) -> bool:
-        """Asynchronous version of check method."""
+    async def check_async(self, data_from_invoke: Any,
+                          context: Optional[ExecutionContext] = None) -> bool:
+        """Asynchronous version of check method, respecting use_cache."""
+        if not self.use_cache: 
+            if context: context.log_event(f"Node '{self.name}': Async check caching disabled (use_cache=False).")
+            if self._custom_async_check_fn:
+                return await self._custom_async_check_fn(data_from_invoke)
+            # If no custom_async_check_fn, use default async check logic
+            return await self._default_check_async(data_from_invoke)
+
+        cache_key_data = data_from_invoke
         try:
-            # Consider if cache key generation needs to be async or handle unpickleable async types
-            cache_key = pickle.dumps(data_from_invoke)
+            cache_key = pickle.dumps(cache_key_data)
         except Exception:
-            cache_key = object() # Fallback if data_from_invoke is not picklable
+            cache_key = object()
 
         if cache_key in self._check_cache:
-            if context: 
+            if context:
                 context.log_event(f"Node '{self.name}': Async check result from cache.")
             return self._check_cache[cache_key]
 
-        if self._custom_async_check_fn: # Prioritize native async custom check
+        result: bool
+        if self._custom_async_check_fn:
             result = await self._custom_async_check_fn(data_from_invoke)
-        elif self._custom_check_fn: # Fallback to sync custom check (wrapped by base's check_async)
-            # This path should ideally be handled by super().check_async if not overridden
-            # For clarity, explicit call if we assume AsyncRunnable wants to control it.
-            # However, simpler is to let Runnable.check_async handle this case.
-            # Let's stick to the principle: if _custom_async_check_fn is set, use it.
-            # Otherwise, call _default_check_async.
-            # The `set_check` in `Runnable` now distinguishes between sync and async `func`.
-            # `Runnable.check_async` will call `_custom_async_check_fn` if set.
-             result = await self._default_check_async(data_from_invoke) # Should be overridden
-        else:
+        else: # No custom_async_check_fn, use default async
             result = await self._default_check_async(data_from_invoke)
 
+        # self._check_cache is written to only if self.use_cache was True (due to initial check)
         self._check_cache[cache_key] = result
-        if context: 
+        if context:
             context.log_event(f"Node '{self.name}': Async check result: {result}.")
         return result
 
@@ -166,41 +178,25 @@ class AsyncRunnable(Runnable):
     async def _internal_invoke_async(self, input_data: Any, context: ExecutionContext) -> Any:
         """Subclasses must implement this for their core asynchronous logic."""
         pass
-    
-    # This method provides synchronous compatibility for AsyncRunnable instances.
-    # It allows an AsyncRunnable to be used where a synchronous Runnable.invoke() is expected.
+
     def _internal_invoke(self, input_data: Any, context: ExecutionContext) -> Any:
-        """Synchronous wrapper for the asynchronous internal invocation."""
-        # logger.info(f"AsyncRunnable '{self.name}': _internal_invoke (sync) called, running _internal_invoke_async via asyncio.run().")
+        logger.info(f"AsyncRunnable '{self.name}': _internal_invoke (sync) called, running _internal_invoke_async via asyncio.run().")
         try:
             loop = asyncio.get_running_loop()
-            if loop.is_running(): # If called from within an already running loop (e.g. nested asyncio.run)
-                # This scenario is complex. asyncio.run() cannot be called when a loop is already running.
-                # One option is to create a new task and wait for it, but that requires the caller to be async.
-                # For a synchronous _internal_invoke, if an event loop is already running,
-                # it indicates a potential misuse or a complex nesting scenario.
-                # A common pattern is to use a new thread for asyncio.run if needed, or use a library like nest_asyncio.
-                # For now, let's log a warning. The behavior might be unexpected.
-                logger.warning(f"AsyncRunnable '{self.name}': _internal_invoke called while an event loop is already running. This may lead to issues.")
-                # Fallback: try to schedule and wait if possible, but this is tricky.
-                # This is a simplification; robust handling of nested loops is non-trivial.
-                # This will likely block if called from a sync function within an async task that's part of a running loop.
-                # It's better if the composition layer (e.g. Pipeline) is async-aware.
-                future = asyncio.ensure_future(self._internal_invoke_async(input_data, context))
-                # How to wait for future synchronously without blocking the loop it might be part of?
-                # This is where `asyncio.run` is problematic inside a running loop.
-                # If this method is called, it implies a synchronous context.
-                # The original asyncio.run() is generally for top-level entry points or separate threads.
-                # Given this is a synchronous method, if a loop is running, it was started by something else.
-                # This situation is best avoided by using async composition (e.g. AsyncPipeline).
-                # Forcing it here: (This is not ideal and can deadlock or error)
-                # return loop.run_until_complete(future) # This can't be called if loop is running from outside
-                logger.error(f"FATAL: AsyncRunnable '{self.name}'._internal_invoke called synchronously from an async context. This is not supported correctly. Use invoke_async.")
-                raise RuntimeError(f"AsyncRunnable '{self.name}' cannot be invoked synchronously using _internal_invoke from an already running event loop.")
-
-        except RuntimeError: # No running event loop
-             pass # Proceed to asyncio.run as intended for sync invocation from a sync context
-
+            if loop.is_running():
+                # This is a problematic scenario: calling asyncio.run() from an already running loop.
+                logger.error(
+                    f"FATAL: AsyncRunnable '{self.name}'._internal_invoke was called synchronously "
+                    f"from within an active asyncio event loop. This will lead to errors. "
+                    f"Use 'await {self.name}.invoke_async()' instead."
+                )
+                # Raising an error is better than letting asyncio.run() fail with a less clear message.
+                raise RuntimeError(
+                    f"AsyncRunnable '{self.name}'._internal_invoke cannot be called synchronously "
+                    f"from an active event loop. Use 'await {self.name}.invoke_async()'."
+                )
+        except RuntimeError:  # No running event loop, which is the expected case for this sync wrapper
+            pass
         return asyncio.run(self._internal_invoke_async(input_data, context))
 
 
@@ -220,9 +216,6 @@ class AsyncRunnable(Runnable):
         return NotImplemented
 
     def __ror__(self, other: Runnable) -> 'AsyncPipeline':
-        # Handles: sync_runnable | async_runnable
-        # If other is a Runnable (sync or async) and self is AsyncRunnable,
-        # the result should be an AsyncPipeline.
         if isinstance(other, Runnable) and not isinstance(other, dict):
             return AsyncPipeline(other, self)
         return NotImplemented
@@ -233,9 +226,6 @@ class AsyncRunnable(Runnable):
         # If self is AsyncRunnable, the conditional structure should be async-aware.
         return _AsyncPendingConditional(self, true_branch)
 
-    # __rmod__ might be needed if a sync runnable is on the left of % with an async runnable true_branch
-    # e.g., sync_cond % async_true_branch.
-    # For now, relying on AsyncRunnable being the condition for _AsyncPendingConditional.
 
 class _AsyncPendingConditional:
     def __init__(self, condition_r: Runnable, true_r: Runnable):

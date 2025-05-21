@@ -211,7 +211,7 @@ class TestCompiledGraph(unittest.TestCase):
             self.fail("RuntimeError not raised")
 
     def test_compiled_graph_caching(self):
-        graph = WorkflowGraph(name="CacheTestG")
+        graph = WorkflowGraph(name="CacheTestG",use_cache = True)
         
         # Use a list to track calls to the side effect, as MagicMock identity changes with deepcopy
         call_tracker = []

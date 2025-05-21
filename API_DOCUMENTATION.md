@@ -39,6 +39,7 @@ classDiagram
         +_on_complete_handler: Optional[Union[Runnable, Callable]]
         +_retry_config: Optional[Dict]
         +_cache_key_generator: Callable
+        +use_cache: Bool
         +invoke(input_data: Any, context: ExecutionContext) Any
         +invoke_async(input_data: Any, context: ExecutionContext) Coroutine
         +_internal_invoke(input_data: Any, context: ExecutionContext) Any
@@ -245,6 +246,7 @@ classDiagram
     - 可调用对象 (`Callable[[ExecutionContext], Any]`): 一个函数，接收 `ExecutionContext`，返回实际输入数据。
 - `_invoke_cache: Dict[Any, Any]`: 内部字典，用于缓存 `invoke` 方法的结果。键由 `_cache_key_generator` 生成。
 - `_check_cache: Dict[Any, bool]`: 内部字典，用于缓存 `check` 方法的结果。键是 `data_from_invoke` 序列化后的结果。
+- `use_cache: Bool`: 是否使用cache
 - `_custom_check_fn: Optional[Callable[[Any], bool]]`: 用户定义的同步检查函数。
 - `_custom_async_check_fn: Optional[Callable[[Any], Coroutine[Any, Any, bool]]]` : 用户定义的异步检查协程函数。通过 `set_check` 方法设置。
 - `_error_handler: Optional[Union['Runnable', Callable[[ExecutionContext, Any, Exception], Any]]]`: 当此 `Runnable` 执行失败且不重试时，调用的错误处理器。可以是另一个 `Runnable` 实例或一个可调用函数。

@@ -18,7 +18,7 @@ class WorkflowGraph:
     A builder class for defining graph nodes (Runnable instances) and edges
     (dependencies and data mapping between nodes).
     """
-    def __init__(self, name: Optional[str] = None):
+    def __init__(self, name: Optional[str] = None, use_cache: bool = False):
         self.name: str = name or f"WorkflowGraph_{id(self)}"
         self.nodes: Dict[str, Runnable] = {}
         self.edges: Dict[str, List[Tuple[str, Optional[Callable[[Any, Dict[str, Any]], Any]]]]] = {}
@@ -26,6 +26,7 @@ class WorkflowGraph:
         self._in_degree: Dict[str, int] = {} 
         self.entry_points: List[str] = []
         self.output_node_names: List[str] = []
+        self.use_cache = use_cache
 
     def add_node(self, runnable: Runnable, node_name: Optional[str] = None) -> str:
         if not isinstance(runnable, Runnable):
@@ -126,7 +127,8 @@ class WorkflowGraph:
             sorted_node_names=sorted_node_names,
             entry_point_names=effective_entry_points,
             output_node_names=effective_output_nodes,
-            graph_definition_name=self.name
+            graph_definition_name=self.name,
+            use_cache = self.use_cache
         )
 
 

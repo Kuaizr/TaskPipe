@@ -211,27 +211,26 @@ classDiagram
 
 ## 核心 API
 
-### 1. `taskpipe.ExecutionContext`
+### 1. `taskpipe.ExecutionContext` 与 `taskpipe.InMemoryExecutionContext`
 
-此类用于在工作流执行期间携带状态和节点输出。对于同步和异步工作流均适用。
+`ExecutionContext` 现为一个 `Protocol`（接口），定义了 `add_output`、`get_output`、`log_event` 等核心方法，用于在工作流执行过程中共享状态、事件日志和父子上下文链路。
 
-**主要属性:**
+`InMemoryExecutionContext` 是该协议的默认实现：所有数据保存在内存中，适合本地和嵌入式场景。你可以实现自定义的 `ExecutionContext`（例如 `RedisExecutionContext`、`DatabaseExecutionContext`）以支持持久化和跨进程任务恢复。
 
-- `initial_input: Any`: 工作流或当前图执行的初始输入数据。默认为 `NO_INPUT`。
-- `node_outputs: Dict[str, Any]`: 存储已执行节点的输出，键是节点名称。
-- `event_log: List[str]`: 记录工作流执行期间的事件（带时间戳）。
-- `parent_context: Optional['ExecutionContext']`: 指向父执行上下文的引用，主要用于 `CompiledGraph` 内部，以允许图内节点访问图外部的上下文信息。
+**InMemoryExecutionContext 主要属性：**
 
-**主要方法:**
+- `initial_input: Any`: 工作流的初始输入数据。
+- `node_outputs: Dict[str, Any]`: 已执行节点的输出集合。
+- `event_log: List[str]`: 执行过程中记录的事件（带时间戳，便于调试）。
+- `parent_context: Optional[ExecutionContext]`: 可选的父上下文，实现嵌套/子流程。
 
-- `__init__(self, initial_input: Any = NO_INPUT, parent_context: Optional['ExecutionContext'] = None)`: 构造函数。
-- `add_output(self, node_name: str, value: Any)`: 将节点输出添加到 `node_outputs` 中。如果 `node_name` 为空或无效，则仅记录事件。
-- `get_output(self, node_name: str, default: Any = None) -> Any`: 从当前上下文的 `node_outputs` 获取节点输出。如果当前上下文没有找到，并且存在 `parent_context`，则递归地从父上下文获取。
-- `log_event(self, message: str)`: 记录一个带时间戳的事件到 `event_log`。
+**主要方法：**
 
-**特殊值:**
+- `add_output(node_name, value)`: 写入节点输出。
+- `get_output(node_name, default=None)`: 读取节点输出，可回溯父上下文。
+- `log_event(message)`: 写入事件日志。
 
-- `taskpipe.NO_INPUT`: 一个哨兵对象，用于标记 `Runnable` 没有接收到直接的 `input_data` 参数，此时 `Runnable` 通常会尝试从 `ExecutionContext` 或其 `input_declaration` 来解析实际输入。
+> 仍可通过 `taskpipe.NO_INPUT` 表示“没有直接输入”，此时 `Runnable` 的 `input_declaration` 会被解析。
 
 ### 2. `taskpipe.Runnable` (ABC)
 
@@ -388,6 +387,12 @@ classDiagram
   * `condition_check_runnable` 通过 `await condition_check_runnable.check_async(...)` 进行检查。
   * 如果条件为真，`body_runnable` 通过 `await body_runnable.invoke_async(...)` 执行。
   * 重复直到条件为假或达到 `max_loops`。
+* **`AgentLoop(AsyncRunnable)`**:
+  * 封装 ReAct/Agent 循环：`generator` 负责决定下一步行动。
+  * 调用 `generator.invoke_async()` 得到结果：
+    * 如果结果是 `Runnable`，则立即执行该 `Runnable` 并将其输出作为下一轮 `generator` 的输入。
+    * 如果结果是普通值，则循环结束并返回该值。
+  * 可通过 `max_iterations` 防止无限循环。
 
 ### 5. `taskpipe.graph.WorkflowGraph`
 
@@ -409,6 +414,10 @@ classDiagram
 * `set_entry_point(self, node_name: str) -> 'WorkflowGraph'`: 设置图的一个入口节点。
 * `set_output_nodes(self, node_names: List[str]) -> 'WorkflowGraph'`: 设置图的输出节点列表。
 * `compile(self) -> 'CompiledGraph'`: 分析图结构（进行拓扑排序以检测循环并确定执行顺序），并返回一个可执行的 `CompiledGraph` 实例。
+* `to_json(self) -> Dict[str, Any]`: 将当前图序列化，便于持久化或下发至低代码平台（暂不序列化复杂的 `input_mapper`）。
+* `@classmethod from_json(cls, json_data: Dict[str, Any], registry: Dict[str, Union[Runnable, Callable[[], Runnable]]]) -> WorkflowGraph`: 根据 JSON + 注册表重建工作流，其中 `registry` 负责把节点的 `"ref"` 映射为可实例化的 `Runnable`。
+
+同时，任何 `Runnable`/`AsyncRunnable` 都可以调用 `.to_graph(graph_name=None)`。该方法会递归地“展开”由 `|`、`%`、`>>` 等操作符构建的动态结构，生成一个等价的 `WorkflowGraph`，从而实现代码模式与声明式模式之间的互操作。请参考 `examples/example.py`：该示例将图保存为 `examples/numbers_workflow.json`，并展示如何通过 `WorkflowGraph.from_json(...)` + `registry` 反序列化回可执行的图。
 
 ### 6. `taskpipe.graph.CompiledGraph(Runnable)`
 

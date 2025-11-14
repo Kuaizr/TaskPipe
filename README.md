@@ -14,7 +14,8 @@ TaskPipe 是一个 Python 框架，用于构建、组合和执行复杂的工作
     * `condition_task % true_task >> false_task`: 定义条件逻辑。如果条件任务或任一分支是异步的，则结果通常是 `AsyncConditional`。
     * `source_task | {"branch1": task_b, "branch2": task_c}`: 将 `source_task` 的输出扇出到多个并行分支 `task_b` 和 `task_c`。结果是 `BranchAndFanIn` (或 `AsyncBranchAndFanIn`) 作为流水线的下一步。
     * `SourceParallel({"branch1": task_a, "branch2": task_b})`: 从共同的（或无）输入并行运行多个任务或流水线。
-* **执行上下文 (`ExecutionContext`)**: 一个共享的 `ExecutionContext` 对象在工作流执行期间流动，允许任务之间共享数据、访问先前执行任务的输出，并记录事件。
+* **执行上下文 (`ExecutionContext`)**: `ExecutionContext` 现在是一个协议（接口），默认实现 `InMemoryExecutionContext` 在工作流执行期间流动，允许任务之间共享数据、访问先前执行任务的输出，并记录事件。你也可以实现 `RedisExecutionContext` / `DatabaseExecutionContext` 以满足持久化与分布式需求。
+* **AgentLoop / 动态 Agent**: 在 `AsyncRunnable` 家族中新增 `AgentLoop`，可封装经典的 ReAct/Tool-Calling 循环：生成器 `Runnable` 可以动态返回“下一步任务”并在事件循环中继续执行，直到返回最终结果。
 * **缓存**: 内置支持对 `Runnable` 的 `invoke`/`invoke_async` 和 `check`/`check_async` 方法的结果进行缓存，以加速重复执行和条件判断。
 * **错误处理与重试**:
     * 可以为每个 `Runnable` 配置错误处理器和重试机制。
@@ -23,6 +24,7 @@ TaskPipe 是一个 Python 框架，用于构建、组合和执行复杂的工作
     * 新增 `on_start` 和 `on_complete` 生命周期钩子，允许用户在任务执行的关键阶段（开始前和完成后）注入自定义逻辑。
     * 这些钩子（包括增强后的 `on_error`）都可以接受 `Runnable` 实例或普通可调用函数作为处理器，为日志记录、资源管理、监控和通知等场景提供了极大的灵活性。
 * **基于图的定义 (可选)**: 对于更复杂或需要集中管理的工作流，可以使用 `WorkflowGraph` 以声明方式定义节点和边，然后将其编译为可执行的 `CompiledGraph`。`CompiledGraph` 同样支持同步和异步执行。**需要注意的是，当一个包含异步节点的 `CompiledGraph` 通过其同步方法 `compiled_graph.invoke()` 执行时，图中的每个异步节点会通过 `AsyncRunnable._internal_invoke -> asyncio.run()` 的路径被依次、同步地执行，这会失去这些异步节点之间潜在的并发性。通过 `await compiled_graph.invoke_async()` 执行时，则能很好地利用 `asyncio` 的并发能力。**
+* **图 ↔ 代码 双向转换**: 任意 `Runnable`（例如通过 `|` 操作符构建的“PyTorch 风格”流水线）都可以调用 `.to_graph()` 导出为 `WorkflowGraph`，而 `WorkflowGraph.from_json()` / `WorkflowGraph.to_json()` 允许平台化场景进行持久化、可视化与低代码集成。目前示例脚本会将导出的 JSON 保存到 `examples/numbers_workflow.json`，便于直接加载或上传。
 * **可扩展性**: 用户可以轻松创建自己的、继承自 `Runnable` 或 `AsyncRunnable` 的自定义任务类型，以封装特定的业务逻辑。
 * **明确的调用约定**:
     * 当从**同步代码**中调用工作流或 `Runnable` 时，使用其 `.invoke()` 方法。如果 `Runnable` 是异步的，其 `.invoke()` 方法内部通常会使用 `asyncio.run()` 来执行异步逻辑（注意：这不能在已运行的事件循环中调用）。

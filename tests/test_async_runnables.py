@@ -2,9 +2,10 @@ import unittest
 import asyncio
 import time
 import logging
+from typing import List
 from unittest.mock import MagicMock, call
 
-from taskpipe.runnables import Runnable, SimpleTask, ExecutionContext, NO_INPUT, Pipeline as SyncPipeline
+from taskpipe.runnables import Runnable, SimpleTask, ExecutionContext, InMemoryExecutionContext, NO_INPUT, Pipeline as SyncPipeline
 from taskpipe import (
     AsyncRunnable, 
     AsyncPipeline, 
@@ -12,6 +13,7 @@ from taskpipe import (
     AsyncWhile,
     AsyncBranchAndFanIn,
     AsyncSourceParallel,
+    AgentLoop,
     _AsyncPendingConditional # For testing operator if needed
 )
 
@@ -24,6 +26,15 @@ logging.getLogger('taskpipe.async_runnables').setLevel(logging.CRITICAL)
 
 # --- Helper Test Runnables ---
 
+def _unwrap_test_input(input_data):
+    if isinstance(input_data, dict):
+        if not input_data:
+            return NO_INPUT
+        if set(input_data.keys()) == {"_input"}:
+            return input_data["_input"]
+    return input_data
+
+
 class SyncTestTask(Runnable):
     def __init__(self, name="SyncTestTask", side_effect_func=None, delay=0):
         super().__init__(name=name)
@@ -34,12 +45,13 @@ class SyncTestTask(Runnable):
 
     def _internal_invoke(self, input_data, context):
         self.call_count += 1
-        self.inputs_received.append(input_data)
+        effective_input = _unwrap_test_input(input_data)
+        self.inputs_received.append(effective_input)
         if self.delay > 0:
             time.sleep(self.delay) # Simulate blocking work
         if self._side_effect_func:
-            return self._side_effect_func(input_data, context)
-        return f"sync_processed_{self.name}_{input_data}"
+            return self._side_effect_func(effective_input, context)
+        return f"sync_processed_{self.name}_{effective_input}"
 
     def _default_check(self, data_from_invoke) -> bool:
         # Simple check for testing
@@ -58,19 +70,53 @@ class AsyncTestTask(AsyncRunnable):
 
     async def _internal_invoke_async(self, input_data, context):
         self.call_count += 1
-        self.inputs_received.append(input_data)
+        effective_input = _unwrap_test_input(input_data)
+        self.inputs_received.append(effective_input)
         if self.delay > 0:
             await asyncio.sleep(self.delay) # Simulate non-blocking work
         if self._side_effect_coro:
-            return await self._side_effect_coro(input_data, context)
-        return f"async_processed_{self.name}_{input_data}"
+            return await self._side_effect_coro(effective_input, context)
+        return f"async_processed_{self.name}_{effective_input}"
 
     async def _default_check_async(self, data_from_invoke) -> bool:
-        # Simple async check for testing
         if isinstance(data_from_invoke, str) and "block_async" in data_from_invoke:
             return False
         await asyncio.sleep(0.001) # simulate async check
         return True
+
+
+class AppendValueTask(AsyncRunnable):
+    def __init__(self, suffix: str):
+        super().__init__(name=f"Append_{suffix}")
+        self.suffix = suffix
+        self.call_count = 0
+
+    async def _internal_invoke_async(self, input_data, context):
+        self.call_count += 1
+        base_input = _unwrap_test_input(input_data)
+        base = "" if base_input in (NO_INPUT, None) else base_input
+        return f"{base}{self.suffix}"
+
+
+class SequenceGenerator(AsyncRunnable):
+    def __init__(self, tasks: List[AsyncRunnable]):
+        super().__init__(name="SequenceGenerator")
+        self.tasks = list(tasks)
+        self.call_count = 0
+
+    async def _internal_invoke_async(self, input_data, context):
+        self.call_count += 1
+        if self.tasks:
+            return self.tasks.pop(0)
+        return _unwrap_test_input(input_data)
+
+
+class InfiniteGenerator(AsyncRunnable):
+    def __init__(self):
+        super().__init__(name="InfiniteGenerator")
+
+    async def _internal_invoke_async(self, input_data, context):
+        return AppendValueTask("X")
 
 # --- Test Cases ---
 
@@ -111,7 +157,7 @@ class TestAsyncPipeline(unittest.TestCase):
             ar2 = AsyncTestTask("AR2", side_effect_coro=ar2_side_effect)
             
             pipeline = AsyncPipeline(ar1, ar2)
-            context = ExecutionContext()
+            context = InMemoryExecutionContext()
             result = await pipeline.invoke_async("start", context)
             
             self.assertEqual(ar1.call_count, 1)
@@ -132,7 +178,7 @@ class TestAsyncPipeline(unittest.TestCase):
             pipeline1 = AsyncPipeline(ar1, sr2) # AR | SR
             pipeline_full = AsyncPipeline(pipeline1, ar3) # (AR | SR) | AR
             
-            context = ExecutionContext()
+            context = InMemoryExecutionContext()
             start_time = time.time()
             result = await pipeline_full.invoke_async("mix_start", context)
             duration = time.time() - start_time
@@ -181,7 +227,7 @@ class TestAsyncConditional(unittest.TestCase):
 
             # Explicit construction
             conditional = AsyncConditional(cond_task, true_task, false_task)
-            context = ExecutionContext()
+            context = InMemoryExecutionContext()
             result = await conditional.invoke_async("condition_input_for_true", context) # Default check on this string is True
 
             self.assertEqual(cond_task.call_count, 1)
@@ -205,7 +251,7 @@ class TestAsyncConditional(unittest.TestCase):
             conditional_op = cond_task % true_task >> false_task
             self.assertIsInstance(conditional_op, AsyncConditional)
             
-            context = ExecutionContext()
+            context = InMemoryExecutionContext()
             # "condition_input_makes_false" will make custom_checker return False
             result = await conditional_op.invoke_async("condition_input_makes_false", context)
 
@@ -228,12 +274,12 @@ class TestAsyncWhile(unittest.TestCase):
                 return data < 3
             cond_runnable.set_check(cond_check)
 
-            async def body_coro_while(data, context): # data is previous body output or initial
-                return data + 1
+            async def body_coro_while(payload, context): # payload contains loop metadata
+                return payload["last"] + 1
             body_runnable = AsyncTestTask(name="LoopBody", side_effect_coro=body_coro_while)
             
             loop = AsyncWhile(cond_runnable, body_runnable, max_loops=5)
-            context = ExecutionContext()
+            context = InMemoryExecutionContext()
             results = await loop.invoke_async(0, context) # Start with 0
 
             self.assertEqual(results, [1, 2, 3]) # 0->1, 1->2, 2->3 (cond becomes false for 3)
@@ -252,7 +298,7 @@ class TestAsyncParallelComposers(unittest.TestCase):
                 "async_key": ar_branch,
                 "sync_key": sr_branch
             })
-            context = ExecutionContext()
+            context = InMemoryExecutionContext()
             start_time = time.time()
             results = await fan_in.invoke_async("fan_in_input", context)
             duration = time.time() - start_time
@@ -277,7 +323,7 @@ class TestAsyncParallelComposers(unittest.TestCase):
                 "s1": source_ar1,
                 "s2": source_ar2
             })
-            context = ExecutionContext()
+            context = InMemoryExecutionContext()
             start_time = time.time()
             results = await parallel_runner.invoke_async("source_parallel_input", context)
             duration = time.time() - start_time
@@ -313,7 +359,7 @@ class TestAsyncParallelComposers(unittest.TestCase):
             # based on the AsyncRunnable.__or__ logic.
             # If it's SyncBranchAndFanIn, AsyncPipeline will wrap its invoke_async.
 
-            context = ExecutionContext()
+            context = InMemoryExecutionContext()
             results = await workflow.invoke_async("fan_op_input", context)
 
             self.assertEqual(source_task.call_count, 1)
@@ -324,6 +370,27 @@ class TestAsyncParallelComposers(unittest.TestCase):
             self.assertEqual(results["async_b"], "async_processed_AR_OpBranch_async_processed_FanSource_fan_op_input")
             self.assertEqual(results["sync_b"], "sync_processed_SR_OpBranch_async_processed_FanSource_fan_op_input")
 
+        asyncio.run(run_test())
+
+
+class TestAgentLoop(unittest.TestCase):
+    def test_agent_loop_completes_sequence(self):
+        async def run_test():
+            generator = SequenceGenerator([
+                AppendValueTask("A"),
+                AppendValueTask("B")
+            ])
+            loop = AgentLoop(generator, max_iterations=5)
+            result = await loop.invoke_async("")
+            self.assertEqual(result, "AB")
+            self.assertEqual(generator.call_count, 3)  # 两次生成 + 最后一轮返回结果
+        asyncio.run(run_test())
+
+    def test_agent_loop_max_iterations_guard(self):
+        async def run_test():
+            loop = AgentLoop(InfiniteGenerator(), max_iterations=2)
+            with self.assertRaisesRegex(RuntimeError, "max_iterations"):
+                await loop.invoke_async("")
         asyncio.run(run_test())
 
 

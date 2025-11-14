@@ -4,6 +4,7 @@ logger.addHandler(logging.NullHandler())
 # 从 runnables 模块提升常用类
 from .runnables import (
     ExecutionContext,
+    InMemoryExecutionContext,
     Runnable,
     SimpleTask,
     Pipeline,
@@ -23,6 +24,7 @@ from .async_runnables import (
     AsyncWhile,
     AsyncBranchAndFanIn,
     AsyncSourceParallel,
+    AgentLoop,
     _AsyncPendingConditional
 )
 
@@ -35,7 +37,7 @@ from .graph import (
 # 可以定义 __all__ 来控制 from taskpipe import * 的行为
 __all__ = [
     # Runnable base and ExecutionContext
-    'ExecutionContext', 'Runnable', 'NO_INPUT',
+    'ExecutionContext', 'InMemoryExecutionContext', 'Runnable', 'NO_INPUT',
     # Sync Runnables
     'SimpleTask', 'Pipeline', 'Conditional', 'BranchAndFanIn',
     'SourceParallel', 'While', 'MergeInputs',
@@ -43,7 +45,7 @@ __all__ = [
     'AsyncRunnable',
     # Async Composers
     'AsyncPipeline', 'AsyncConditional', 'AsyncBranchAndFanIn','_AsyncPendingConditional',
-    'AsyncSourceParallel', 'AsyncWhile',
+    'AsyncSourceParallel', 'AsyncWhile', 'AgentLoop',
     # Graph components
     'WorkflowGraph', 'CompiledGraph'
 ]

@@ -8,6 +8,7 @@ from typing import Any, Optional, Dict, List, Tuple, Union, Type, Coroutine
 from .runnables import (
     Runnable, 
     ExecutionContext,
+    InMemoryExecutionContext,
     NO_INPUT,
     _default_cache_key_generator,
     Pipeline as SyncPipeline, # For operator fallback if needed
@@ -27,30 +28,13 @@ class AsyncRunnable(Runnable):
     async def invoke_async(self, input_data: Any = NO_INPUT,
                            context: Optional[ExecutionContext] = None) -> Any:
         """Asynchronous invoke method. Handles input declaration, caching (respecting use_cache), retries, and error handling."""
-        effective_context = context if context is not None else ExecutionContext(
+        effective_context = context if context is not None else InMemoryExecutionContext(
             initial_input=input_data if input_data is not NO_INPUT else None)
 
-        actual_input_for_invoke = input_data
-        if self.input_declaration and input_data is NO_INPUT and effective_context:
-            if isinstance(self.input_declaration, str):
-                actual_input_for_invoke = effective_context.get_output(self.input_declaration)
-            elif isinstance(self.input_declaration, dict):
-                kwargs_from_context = {}
-                for param_name, source_key in self.input_declaration.items():
-                    if isinstance(source_key, str):
-                        kwargs_from_context[param_name] = effective_context.get_output(source_key)
-                    else:
-                        kwargs_from_context[param_name] = source_key
-                actual_input_for_invoke = kwargs_from_context
-            elif callable(self.input_declaration):
-                if asyncio.iscoroutinefunction(self.input_declaration):
-                    actual_input_for_invoke = await self.input_declaration(effective_context)
-                else:
-                    actual_input_for_invoke = self.input_declaration(effective_context)
-
+        prepared_input_for_invoke = await self._prepare_input_payload_async(input_data, effective_context)
         cache_key = None # Initialize
         if self.use_cache:
-            cache_key = self._get_cache_key(actual_input_for_invoke, effective_context)
+            cache_key = self._get_cache_key(prepared_input_for_invoke, effective_context)
             if cache_key in self._invoke_cache:
                 effective_context.log_event(f"Node '{self.name}': Async invoke result from cache.")
                 result = self._invoke_cache[cache_key]
@@ -73,10 +57,10 @@ class AsyncRunnable(Runnable):
             current_attempt += 1
             effective_context.log_event(
                 f"Node '{self.name}': Async invoking (Attempt {current_attempt}/{max_attempts}). "
-                f"Input type: {type(actual_input_for_invoke).__name__}")
+                f"Input type: {type(prepared_input_for_invoke).__name__}")
 
             try:
-                result = await self._internal_invoke_async(actual_input_for_invoke, effective_context)
+                result = await self._internal_invoke_async(prepared_input_for_invoke, effective_context)
                 if self.use_cache and cache_key is not None: 
                     self._invoke_cache[cache_key] = result
                 effective_context.log_event(
@@ -105,7 +89,7 @@ class AsyncRunnable(Runnable):
                         try:
                             if isinstance(self._error_handler, Runnable): # Check if it's a Runnable
                                 error_handler_output = await self._error_handler.invoke_async(
-                                    actual_input_for_invoke, effective_context)
+                                    prepared_input_for_invoke, effective_context)
                                 effective_context.log_event(
                                     f"Node '{self.name}': Async error handler "
                                     f"'{getattr(self._error_handler, 'name', 'UnnamedErrorHandler')}' executed.")
@@ -135,6 +119,35 @@ class AsyncRunnable(Runnable):
             raise last_exception
         else:
             raise RuntimeError(f"AsyncRunnable '{self.name}': Exited retry loop unexpectedly without result or exception.")
+
+    async def _context_inputs_from_declaration_async(self, context: Optional[ExecutionContext]) -> Dict[str, Any]:
+        if not self.input_declaration or context is None:
+            return {}
+
+        if isinstance(self.input_declaration, str):
+            return {"_input": context.get_output(self.input_declaration)}
+
+        if isinstance(self.input_declaration, dict):
+            resolved: Dict[str, Any] = {}
+            for param_name, source_key in self.input_declaration.items():
+                if isinstance(source_key, str):
+                    resolved[param_name] = context.get_output(source_key)
+                else:
+                    resolved[param_name] = source_key
+            return resolved
+
+        if callable(self.input_declaration):
+            if asyncio.iscoroutinefunction(self.input_declaration):
+                value = await self.input_declaration(context)
+            else:
+                value = self.input_declaration(context)
+            return self._normalize_callable_input_value(value)
+
+        raise TypeError("input_declaration must be a str, dict, or callable.")
+
+    async def _prepare_input_payload_async(self, direct_input: Any, effective_context: Optional[ExecutionContext]) -> Dict[str, Any]:
+        context_inputs = await self._context_inputs_from_declaration_async(effective_context)
+        return self._merge_input_payloads(context_inputs, direct_input)
 
 
     async def check_async(self, data_from_invoke: Any,
@@ -264,6 +277,14 @@ class AsyncPipeline(AsyncRunnable):
         # Delegate check to the second runnable in the pipeline
         return await self.second.check_async(data_from_invoke)
 
+    def _expand_to_graph(self, graph: 'WorkflowGraph', helper: '_GraphExportHelper') -> Tuple[List[str], List[str]]:
+        entry_first, exit_first = self.first._expand_to_graph(graph, helper)
+        entry_second, exit_second = self.second._expand_to_graph(graph, helper)
+        for parent in exit_first:
+            for child in entry_second:
+                graph.add_edge(parent, child)
+        return entry_first, exit_second
+
 
 class AsyncConditional(AsyncRunnable):
     def __init__(self, condition_r: Runnable, true_r: Runnable, false_r: Runnable, name: Optional[str] = None, **kwargs):
@@ -300,14 +321,21 @@ class AsyncWhile(AsyncRunnable):
         context.log_event(f"Node '{self.name}': Starting async loop (max_loops={self.max_loops}).")
         while loop_count < self.max_loops:
             context.log_event(f"Node '{self.name}': Loop {loop_count + 1}. Evaluating condition '{self.condition_check_runnable.name}'.")
-            condition_output = await self.condition_check_runnable.invoke_async(current_input_for_iteration, context)
+            condition_input = self._unwrap_input_payload(current_input_for_iteration)
+            condition_output = await self.condition_check_runnable.invoke_async(condition_input, context)
             
             if not await self.condition_check_runnable.check_async(condition_output, context):
                 context.log_event(f"Node '{self.name}': Condition FALSE. Exiting loop after {loop_count} iterations.")
                 break
             
             context.log_event(f"Node '{self.name}': Condition TRUE. Executing body '{self.body_runnable.name}'.")
-            body_output = await self.body_runnable.invoke_async(current_input_for_iteration, context)
+            history_snapshot = [self._unwrap_input_payload(item) for item in all_body_outputs]
+            loop_input_payload = {
+                "last": self._unwrap_input_payload(current_input_for_iteration),
+                "history": history_snapshot,
+                "iteration": loop_count,
+            }
+            body_output = await self.body_runnable.invoke_async(loop_input_payload, context)
             all_body_outputs.append(body_output)
             
             current_input_for_iteration = body_output
@@ -317,6 +345,40 @@ class AsyncWhile(AsyncRunnable):
         
         context.log_event(f"Node '{self.name}': Loop finished. Returning {len(all_body_outputs)} outputs.")
         return all_body_outputs
+
+
+class AgentLoop(AsyncRunnable):
+    """
+    动态执行循环，允许生成器 Runnable 在运行过程中返回下一个 Runnable。
+    当生成器返回普通结果（非 Runnable）时循环结束。
+    """
+    def __init__(self, generator: Runnable, max_iterations: int = 25, name: Optional[str] = None, **kwargs):
+        super().__init__(name or f"AgentLoop[{generator.name}]", **kwargs)
+        self.generator = generator
+        self.max_iterations = max_iterations
+
+    async def _internal_invoke_async(self, input_data: Any, context: ExecutionContext) -> Any:
+        current_payload = input_data
+        iteration = 0
+
+        while iteration < self.max_iterations:
+            iteration += 1
+            context.log_event(f"Node '{self.name}': Iteration {iteration}, invoking generator '{self.generator.name}'.")
+            generated = await self.generator.invoke_async(current_payload, context)
+
+            if isinstance(generated, Runnable):
+                context.log_event(
+                    f"Node '{self.name}': Generator produced runnable '{generated.name}'. Executing it next."
+                )
+                current_payload = await generated.invoke_async(current_payload, context)
+                continue
+
+            context.log_event(f"Node '{self.name}': Generator returned terminal result. Loop completed.")
+            return generated
+
+        raise RuntimeError(
+            f"AgentLoop '{self.name}' exceeded max_iterations ({self.max_iterations}) without producing a terminal result."
+        )
 
 
 class AsyncBranchAndFanIn(AsyncRunnable):
@@ -338,7 +400,10 @@ class AsyncBranchAndFanIn(AsyncRunnable):
         
         # Create coroutines for each task using invoke_async
         coroutines_map = {
-            key: task.invoke_async(input_data, context)
+            key: task.invoke_async(
+                input_data if not task.input_declaration else NO_INPUT,
+                context
+            )
             for key, task in self.tasks_dict.items()
         }
         
@@ -382,7 +447,8 @@ class AsyncSourceParallel(AsyncRunnable):
 
     async def _internal_invoke_async(self, input_data: Any, 
                                    context: ExecutionContext) -> Dict[str, Any]:
-        actual_input = input_data if input_data is not NO_INPUT else context.initial_input
+        unwrapped_input = self._unwrap_input_payload(input_data)
+        actual_input = context.initial_input if unwrapped_input is NO_INPUT else unwrapped_input
         context.log_event(
             f"Node '{self.name}': Starting async parallel source execution for "
             f"{len(self.tasks_dict)} tasks. Input type: {type(actual_input).__name__}")

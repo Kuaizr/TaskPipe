@@ -1,4 +1,16 @@
-from taskpipe import SimpleTask, ExecutionContext, Runnable, NO_INPUT
+import asyncio
+import json
+
+from taskpipe import (
+    SimpleTask,
+    InMemoryExecutionContext as ExecutionContext,
+    Runnable,
+    AsyncRunnable,
+    AgentLoop,
+    WorkflowGraph,
+    SourceParallel,
+    NO_INPUT,
+)
 
 
 def two() -> int:
@@ -20,9 +32,16 @@ def process_add_three(val: str) -> str:
 # 对于条件，我们需要一个 Runnable，其 check 方法定义条件逻辑
 class ValueCondition(Runnable):
     def _internal_invoke(self, input_data: int, context: ExecutionContext) -> int:
-        return input_data # Pass through
+        return self._unwrap(input_data) # Pass through
+
     def _default_check(self, data_from_invoke: int) -> bool:
-        return data_from_invoke > 10 # 条件：值是否大于10
+        return self._unwrap(data_from_invoke) > 10 # 条件：值是否大于10
+
+    @staticmethod
+    def _unwrap(value):
+        if isinstance(value, dict) and "_input" in value:
+            return value["_input"]
+        return value
 
 condition_runnable = ValueCondition(name="ValueCheck")
 large_val_task = SimpleTask(process_large_value, name="ProcessLarge")
@@ -46,7 +65,6 @@ ctx2 = ExecutionContext()
 result2 = work2.invoke(NO_INPUT, ctx2)
 print(f"Result for 13: {result2}")
 # --- 新增测试：合并 work1 和 work2 的输出 ---
-from taskpipe.runnables import SourceParallel
 
 def add_all_results(**results_kwargs: str) -> str:
     """
@@ -157,10 +175,13 @@ print(f"Result of pipeline_A_BC_D: {result_pipeline_A_BC_D}")
 # --- 新增测试: 一步到位定义 A | {B,C} | D 工作流 ---
 # (combined_workflow | {mul, div}) | summary
 
-pipeline_one_step = (combined_workflow | {
-    "multiplied_value": multiply_task,
-    "divided_value": divide_task
-}) | summary_task # summary_task 和 multiply_task, divide_task 已在前面定义
+pipeline_one_step = (
+    combined_workflow
+    | {
+        "multiplied_value": multiply_task,
+        "divided_value": divide_task,
+    }
+) | summary_task  # summary_task 和 multiply_task, divide_task 已在前面定义
 
 print("\n--- Testing A | {B,C} | D pipeline (one-step definition) ---")
 ctx_one_step = ExecutionContext()
@@ -173,3 +194,68 @@ print(f"Result of pipeline_one_step: {result_one_step}")
 # 验证一下名称 (可选)
 # print(f"Name of pipeline_one_step: {pipeline_one_step.name}")
 # 它会自动生成一个类似 Pipeline[(Pipeline[...]_then_BranchFanIn[...])_then_SummarizePipelineOutput] 的名称
+
+
+# --- AgentLoop 示例 ---
+
+
+class SequencePlanner(AsyncRunnable):
+    """
+    一个简单的 Planner，每次被调用返回下一步要执行的 Runnable。
+    当所有步骤完成后，直接返回当前累积的 payload（字符串），AgentLoop 将结束循环。
+    """
+
+    def __init__(self, steps):
+        super().__init__(name="SequencePlanner")
+        self._steps = list(steps)
+
+    async def _internal_invoke_async(self, input_data, context):
+        if self._steps:
+            return self._steps.pop(0)
+        return input_data
+
+
+async def demo_agent_loop():
+    steps = [
+        SimpleTask(lambda payload: f"{payload} -> gather_info", name="GatherInfo"),
+        SimpleTask(lambda payload: f"{payload} -> analyze", name="Analyze"),
+        SimpleTask(lambda payload: f"{payload} -> finalize", name="Finalize"),
+    ]
+    planner = SequencePlanner(steps)
+    agent = AgentLoop(planner, max_iterations=5)
+    ctx = ExecutionContext()
+    result = await agent.invoke_async("user_question", ctx)
+    print("\n--- AgentLoop demo ---")
+    print("AgentLoop final result:", result)
+    print("AgentLoop event log entries:", len(ctx.event_log))
+
+
+asyncio.run(demo_agent_loop())
+
+
+# --- to_graph() + WorkflowGraph JSON 往返示例 ---
+
+
+def demo_graph_serialization():
+    print("\n--- WorkflowGraph serialization demo ---")
+    numbers_workflow = SimpleTask(lambda: 1, name="StartOne") | SimpleTask(
+        lambda value: value + 99, name="Add99"
+    )
+    workflow_graph = numbers_workflow.to_graph("NumbersWorkflow")
+    json_payload = workflow_graph.to_json()
+    print("WorkflowGraph JSON:")
+    print(json.dumps(json_payload, indent=2))
+    with open("examples/numbers_workflow.json", "w", encoding="utf-8") as fp:
+        json.dump(json_payload, fp, ensure_ascii=False, indent=2)
+    print("JSON saved to numbers_workflow.json")
+
+    registry = {
+        "StartOne": lambda: SimpleTask(lambda: 1, name="StartOne"),
+        "Add99": lambda: SimpleTask(lambda value: value + 99, name="Add99"),
+    }
+    rebuilt = WorkflowGraph.from_json(json_payload, registry)
+    rebuilt_result = rebuilt.compile().invoke(NO_INPUT)
+    print("Rebuilt graph result:", rebuilt_result)
+
+
+demo_graph_serialization()

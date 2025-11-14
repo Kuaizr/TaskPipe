@@ -1,0 +1,27 @@
+{
+  "name": "NumbersWorkflow",
+  "nodes": [
+    {
+      "name": "StartOne",
+      "ref": "StartOne",
+      "type": "SimpleTask"
+    },
+    {
+      "name": "Add99",
+      "ref": "Add99",
+      "type": "SimpleTask"
+    }
+  ],
+  "edges": [
+    {
+      "source": "StartOne",
+      "dest": "Add99"
+    }
+  ],
+  "entry_points": [
+    "StartOne"
+  ],
+  "output_nodes": [
+    "Add99"
+  ]
+}

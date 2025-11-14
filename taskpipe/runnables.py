@@ -4,7 +4,13 @@ import logging
 import hashlib
 import pickle
 import asyncio # Added for invoke_async
+import inspect
 from typing import Any, Callable, Optional, Dict, List, Tuple, Union, Type, Coroutine
+
+try:
+    from typing import Protocol, runtime_checkable
+except ImportError:
+    from typing_extensions import Protocol, runtime_checkable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # 用于标记没有显式输入的情况
@@ -14,29 +20,38 @@ logger = logging.getLogger(__name__)
 # 为了避免重复配置（如果用户在其他地方也配置了basicConfig），这里不再配置basicConfig
 # 而是依赖用户在应用层配置logging
 
-class ExecutionContext:
+@runtime_checkable
+class ExecutionContext(Protocol):
+    initial_input: Any
+    parent_context: Optional['ExecutionContext']
+    node_outputs: Dict[str, Any]
+    event_log: List[str]
+
+    def add_output(self, node_name: str, value: Any) -> None: ...
+
+    def get_output(self, node_name: str, default: Any = None) -> Any: ...
+
+    def log_event(self, message: str) -> None: ...
+
+
+class InMemoryExecutionContext:
     """
-    一个在工作流执行期间携带状态和节点输出的对象。
+    默认的内存型 ExecutionContext，实现了 ExecutionContext 协议。
     """
-    def __init__(self, initial_input: Any = NO_INPUT, parent_context: Optional['ExecutionContext'] = None):
+    def __init__(self, initial_input: Any = NO_INPUT, parent_context: Optional[ExecutionContext] = None):
         self.node_outputs: Dict[str, Any] = {}
         self.initial_input: Any = initial_input
         self.event_log: List[str] = []
-        self.parent_context: Optional['ExecutionContext'] = parent_context
+        self.parent_context: Optional[ExecutionContext] = parent_context
 
     def add_output(self, node_name: str, value: Any):
-        """将节点输出添加到上下文中。"""
         if node_name:
             self.node_outputs[node_name] = value
             self.log_event(f"Output added for node '{node_name}'. Value type: {type(value).__name__}")
         else:
-            self.log_event(f"Output for unnamed node not added to context's node_outputs.")
+            self.log_event("Output for unnamed node not added to context's node_outputs.")
 
     def get_output(self, node_name: str, default: Any = None) -> Any:
-        """
-        从上下文中获取节点输出。
-        如果当前上下文没有，且存在父上下文，则尝试从父上下文获取。
-        """
         if node_name in self.node_outputs:
             return self.node_outputs[node_name]
         if self.parent_context:
@@ -44,14 +59,13 @@ class ExecutionContext:
         return default
 
     def log_event(self, message: str):
-        """记录一个事件到事件日志。"""
         timestamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
         full_message = f"[{timestamp}] {message}"
         logger.debug(f"ContextEvent: {message}")
         self.event_log.append(full_message)
 
     def __repr__(self) -> str:
-        return f"<ExecutionContext id={id(self)} initial_input={str(self.initial_input)[:60]}, node_outputs_keys={list(self.node_outputs.keys())}>"
+        return f"<InMemoryExecutionContext id={id(self)} initial_input={str(self.initial_input)[:60]}, node_outputs_keys={list(self.node_outputs.keys())}>"
 
 def _default_cache_key_generator(runnable_name: str, input_data: Any, context: Optional[ExecutionContext], input_declaration: Any) -> Any:
     """
@@ -118,6 +132,57 @@ class Runnable(abc.ABC):
         self._on_start_handler: Optional[Union['Runnable', Callable[[ExecutionContext, Any], None]]] = None
         self._on_complete_handler: Optional[Union['Runnable', Callable[[ExecutionContext, Any, Optional[Exception]], None]]] = None
 
+    def _context_inputs_from_declaration(self, context: Optional[ExecutionContext]) -> Dict[str, Any]:
+        if not self.input_declaration or context is None:
+            return {}
+
+        if isinstance(self.input_declaration, str):
+            return {"_input": context.get_output(self.input_declaration)}
+
+        if isinstance(self.input_declaration, dict):
+            resolved: Dict[str, Any] = {}
+            for param_name, source_key in self.input_declaration.items():
+                if isinstance(source_key, str):
+                    resolved[param_name] = context.get_output(source_key)
+                else:
+                    resolved[param_name] = source_key
+            return resolved
+
+        if callable(self.input_declaration):
+            value = self.input_declaration(context)
+            return self._normalize_callable_input_value(value)
+
+        raise TypeError("input_declaration must be a str, dict, or callable.")
+
+    def _normalize_callable_input_value(self, value: Any) -> Dict[str, Any]:
+        if value is None or value is NO_INPUT:
+            return {}
+        if isinstance(value, dict):
+            return dict(value)
+        return {"_input": value}
+
+    def _merge_input_payloads(self, context_inputs: Optional[Dict[str, Any]], direct_input: Any) -> Dict[str, Any]:
+        merged_input: Dict[str, Any] = dict(context_inputs or {})
+        if direct_input is not NO_INPUT:
+            if isinstance(direct_input, dict):
+                merged_input.update(direct_input)
+            else:
+                merged_input["_input"] = direct_input
+        return merged_input
+
+    def _prepare_input_payload(self, direct_input: Any, effective_context: Optional[ExecutionContext]) -> Dict[str, Any]:
+        context_inputs = self._context_inputs_from_declaration(effective_context)
+        return self._merge_input_payloads(context_inputs, direct_input)
+
+    @staticmethod
+    def _unwrap_input_payload(payload: Any) -> Any:
+        if isinstance(payload, dict):
+            if not payload:
+                return NO_INPUT
+            if set(payload.keys()) == {"_input"}:
+                return payload["_input"]
+        return payload
+
     def _get_cache_key(self, input_data: Any, context: Optional[ExecutionContext]) -> Any:
         return self._cache_key_generator(self.name, input_data, context, self.input_declaration)
 
@@ -149,22 +214,8 @@ class Runnable(abc.ABC):
         return self._error_handler
 
     def invoke(self, input_data: Any = NO_INPUT, context: Optional[ExecutionContext] = None) -> Any:
-        effective_context = context if context is not None else ExecutionContext(initial_input=input_data if input_data is not NO_INPUT else None)
-        
-        actual_input_for_invoke = input_data
-        if self.input_declaration and input_data is NO_INPUT and effective_context:
-            if isinstance(self.input_declaration, str):
-                actual_input_for_invoke = effective_context.get_output(self.input_declaration)
-            elif isinstance(self.input_declaration, dict):
-                kwargs_from_context = {}
-                for param_name, source_key in self.input_declaration.items():
-                    if isinstance(source_key, str): 
-                        kwargs_from_context[param_name] = effective_context.get_output(source_key)
-                    else:
-                        kwargs_from_context[param_name] = source_key
-                actual_input_for_invoke = kwargs_from_context
-            elif callable(self.input_declaration): 
-                actual_input_for_invoke = self.input_declaration(effective_context)
+        effective_context = context if context is not None else InMemoryExecutionContext(initial_input=input_data if input_data is not NO_INPUT else None)
+        prepared_input_for_invoke = self._prepare_input_payload(input_data, effective_context)
 
         task_final_result: Any = NO_INPUT
         task_final_exception: Optional[Exception] = None
@@ -173,9 +224,9 @@ class Runnable(abc.ABC):
             try:
                 effective_context.log_event(f"Node '{self.name}': Executing on_start handler.")
                 if isinstance(self._on_start_handler, Runnable):
-                    self._on_start_handler.invoke(actual_input_for_invoke, effective_context)
+                    self._on_start_handler.invoke(prepared_input_for_invoke, effective_context)
                 elif callable(self._on_start_handler):
-                    self._on_start_handler(effective_context, actual_input_for_invoke)
+                    self._on_start_handler(effective_context, prepared_input_for_invoke)
             except Exception as e_start_hook:
                 effective_context.log_event(f"Node '{self.name}': Error in on_start handler: {type(e_start_hook).__name__}: {e_start_hook}. Task execution will be skipped.")
                 task_final_exception = e_start_hook
@@ -183,7 +234,7 @@ class Runnable(abc.ABC):
         if task_final_exception is None:
             cache_key = None # Initialize cache_key
             if self.use_cache: 
-                cache_key = self._get_cache_key(actual_input_for_invoke, effective_context)
+                cache_key = self._get_cache_key(prepared_input_for_invoke, effective_context)
                 if cache_key in self._invoke_cache:
                     effective_context.log_event(f"Node '{self.name}': Invoke result from cache.")
                     task_final_result = self._invoke_cache[cache_key]
@@ -201,10 +252,10 @@ class Runnable(abc.ABC):
 
                 while current_attempt < max_attempts:
                     current_attempt += 1
-                    effective_context.log_event(f"Node '{self.name}': Invoking (Attempt {current_attempt}/{max_attempts}). Input type: {type(actual_input_for_invoke).__name__}")
+                    effective_context.log_event(f"Node '{self.name}': Invoking (Attempt {current_attempt}/{max_attempts}). Input type: {type(prepared_input_for_invoke).__name__}")
                     
                     try:
-                        result_internal = self._internal_invoke(actual_input_for_invoke, effective_context)
+                        result_internal = self._internal_invoke(prepared_input_for_invoke, effective_context)
                         task_final_result = result_internal
                         task_final_exception = None 
                         
@@ -227,9 +278,9 @@ class Runnable(abc.ABC):
                                 try:
                                     error_handler_output: Any
                                     if isinstance(self._error_handler, Runnable):
-                                        error_handler_output = self._error_handler.invoke(actual_input_for_invoke, effective_context)
+                                        error_handler_output = self._error_handler.invoke(prepared_input_for_invoke, effective_context)
                                     elif callable(self._error_handler): 
-                                        error_handler_output = self._error_handler(effective_context, actual_input_for_invoke, e_internal)
+                                        error_handler_output = self._error_handler(effective_context, prepared_input_for_invoke, e_internal)
                                     
                                     task_final_result = error_handler_output
                                     task_final_exception = None 
@@ -258,7 +309,7 @@ class Runnable(abc.ABC):
                     result_for_callable = task_final_result
                 
                 if isinstance(self._on_complete_handler, Runnable):
-                    self._on_complete_handler.invoke(actual_input_for_invoke, effective_context)
+                    self._on_complete_handler.invoke(prepared_input_for_invoke, effective_context)
                 elif callable(self._on_complete_handler):
                     self._on_complete_handler(effective_context, result_for_callable, task_final_exception)
             except Exception as e_complete_hook:
@@ -383,6 +434,25 @@ class Runnable(abc.ABC):
         new_runnable._check_cache = {}
         return new_runnable
 
+    def to_graph(self, graph_name: Optional[str] = None) -> 'WorkflowGraph':
+        from .graph import WorkflowGraph  # Local import to avoid circular dependency at module load
+
+        graph = WorkflowGraph(name=graph_name or f"GraphFrom_{self.name}")
+        helper = _GraphExportHelper()
+        entry_nodes, exit_nodes = self._expand_to_graph(graph, helper)
+
+        if not entry_nodes or not exit_nodes:
+            raise ValueError(f"Runnable '{self.name}' could not be exported to a graph.")
+
+        for entry in entry_nodes:
+            graph.set_entry_point(entry)
+        graph.set_output_nodes(exit_nodes)
+        return graph
+
+    def _expand_to_graph(self, graph: 'WorkflowGraph', helper: '_GraphExportHelper') -> Tuple[List[str], List[str]]:
+        node_name = helper.add_node(graph, self)
+        return [node_name], [node_name]
+
 
 class _PendingConditional:
     def __init__(self, condition_r: Runnable, true_r: Runnable):
@@ -408,14 +478,36 @@ class SimpleTask(Runnable):
         if not callable(func):
             raise TypeError("func must be a callable")
         self.func = func
+        self._func_signature = inspect.signature(func)
+        self._func_param_names = tuple(self._func_signature.parameters.keys())
+        self._accepts_var_kwargs = any(
+            param.kind == inspect.Parameter.VAR_KEYWORD
+            for param in self._func_signature.parameters.values()
+        )
+        self._expects_context = 'context' in self._func_signature.parameters
 
     def _internal_invoke(self, input_data: Any, context: ExecutionContext) -> Any:
-        if input_data is NO_INPUT:
-            return self.func()
-        elif isinstance(input_data, dict):
-            return self.func(**input_data)
+        if isinstance(input_data, dict):
+            payload = dict(input_data)
+        elif input_data is NO_INPUT:
+            payload = {}
         else:
-            return self.func(input_data)
+            payload = {"_input": input_data}
+
+        call_kwargs = dict(payload)
+        call_args: List[Any] = []
+
+        direct_value = call_kwargs.pop('_input', NO_INPUT)
+        if direct_value is not NO_INPUT:
+            if '_input' in self._func_param_names or self._accepts_var_kwargs:
+                call_kwargs['_input'] = direct_value
+            else:
+                call_args.append(direct_value)
+
+        if self._expects_context and 'context' not in call_kwargs:
+            call_kwargs['context'] = context
+
+        return self.func(*call_args, **call_kwargs)
 
 
 class Pipeline(Runnable):
@@ -439,6 +531,14 @@ class Pipeline(Runnable):
     def _default_check(self, data_from_invoke: Any) -> bool:
         return self.second.check(data_from_invoke) 
 
+    def _expand_to_graph(self, graph: 'WorkflowGraph', helper: '_GraphExportHelper') -> Tuple[List[str], List[str]]:
+        entry_first, exit_first = self.first._expand_to_graph(graph, helper)
+        entry_second, exit_second = self.second._expand_to_graph(graph, helper)
+        for parent in exit_first:
+            for child in entry_second:
+                graph.add_edge(parent, child)
+        return entry_first, exit_second
+
 
 class Conditional(Runnable):
     def __init__(self, condition_r: Runnable, true_r: Runnable, false_r: Runnable, name: Optional[str] = None, **kwargs):
@@ -451,6 +551,11 @@ class Conditional(Runnable):
         condition_output = self.condition_r.invoke(input_data, context)
         
         context.log_event(f"Node '{self.name}': Condition output type: {type(condition_output).__name__}. Checking condition.")
+        if getattr(self.condition_r, "_custom_async_check_fn", None) is not None:
+            raise RuntimeError(
+                f"Conditional '{self.name}' detected async check logic on '{self.condition_r.name}'. "
+                "Use AsyncConditional to evaluate asynchronous checks."
+            )
         if self.condition_r.check(condition_output, context): 
             context.log_event(f"Node '{self.name}': Condition TRUE, executing '{self.true_r.name}'.")
             return self.true_r.invoke(condition_output, context)
@@ -473,7 +578,11 @@ class BranchAndFanIn(Runnable):
 
         with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
             future_to_key = {
-                executor.submit(task.invoke, input_data, context): key
+                executor.submit(
+                    task.invoke,
+                    input_data if not task.input_declaration else NO_INPUT,
+                    context
+                ): key
                 for key, task in self.tasks_dict.items()
             }
             exceptions = {}
@@ -508,7 +617,8 @@ class SourceParallel(Runnable):
         self.max_workers = max_workers
 
     def _internal_invoke(self, input_data: Any, context: ExecutionContext) -> Dict[str, Any]:
-        actual_input = input_data if input_data is not NO_INPUT else context.initial_input
+        unwrapped_input = self._unwrap_input_payload(input_data)
+        actual_input = context.initial_input if unwrapped_input is NO_INPUT else unwrapped_input
         context.log_event(f"Node '{self.name}': Starting parallel execution for {len(self.tasks_dict)} tasks. Input type: {type(actual_input).__name__}")
 
         aggregated_results: Dict[str, Any] = {}
@@ -566,7 +676,8 @@ class While(Runnable):
         while loop_count < self.max_loops:
             context.log_event(f"Node '{self.name}': Loop {loop_count + 1}/{self.max_loops}. Evaluating condition '{self.condition_check_runnable.name}'. Input type: {type(current_input_for_iteration).__name__}")
             
-            condition_output = self.condition_check_runnable.invoke(current_input_for_iteration, context)
+            condition_input = self._unwrap_input_payload(current_input_for_iteration)
+            condition_output = self.condition_check_runnable.invoke(condition_input, context)
             
             context.log_event(f"Node '{self.name}': Loop {loop_count + 1}. Condition output type: {type(condition_output).__name__}. Checking condition.")
             if not self.condition_check_runnable.check(condition_output, context):
@@ -575,7 +686,13 @@ class While(Runnable):
             
             context.log_event(f"Node '{self.name}': Loop {loop_count + 1}, Condition TRUE, executing body '{self.body_runnable.name}'. Body input type: {type(current_input_for_iteration).__name__}")
             
-            body_output = self.body_runnable.invoke(current_input_for_iteration, context)
+            history_snapshot = [self._unwrap_input_payload(item) for item in all_body_outputs]
+            loop_input_payload = {
+                "last": self._unwrap_input_payload(current_input_for_iteration),
+                "history": history_snapshot,
+                "iteration": loop_count,
+            }
+            body_output = self.body_runnable.invoke(loop_input_payload, context)
             all_body_outputs.append(body_output)
             
             current_input_for_iteration = body_output 
@@ -604,3 +721,20 @@ class MergeInputs(Runnable):
         
         context.log_event(f"Node '{self.name}': Calling merge_function '{getattr(self.merge_function, '__name__', 'custom')}'.")
         return self.merge_function(**kwargs_for_func)
+
+
+class _GraphExportHelper:
+    def __init__(self):
+        self._name_counter: Dict[str, int] = {}
+
+    def _unique_name(self, base_name: Optional[str]) -> str:
+        sanitized = base_name or "Node"
+        count = self._name_counter.get(sanitized, 0)
+        unique = sanitized if count == 0 else f"{sanitized}_{count}"
+        self._name_counter[sanitized] = count + 1
+        return unique
+
+    def add_node(self, graph: 'WorkflowGraph', runnable: Runnable) -> str:
+        node_name = self._unique_name(runnable.name)
+        graph.add_node(runnable, node_name=node_name)
+        return node_name

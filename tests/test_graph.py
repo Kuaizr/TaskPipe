@@ -1,9 +1,10 @@
 import unittest
 import logging
+from typing import Any
 from unittest.mock import MagicMock, ANY
 
 # Assuming runnables.py and graph.py are accessible
-from taskpipe import Runnable, SimpleTask, ExecutionContext, NO_INPUT, MergeInputs
+from taskpipe import Runnable, SimpleTask, ExecutionContext, InMemoryExecutionContext, NO_INPUT, MergeInputs
 from taskpipe import WorkflowGraph, CompiledGraph
 
 # Suppress most logging output during tests
@@ -18,21 +19,32 @@ class GraphTestMockRunnable(Runnable):
         super().__init__(name=name, **kwargs)
         self.invoke_call_count = 0
         self.last_input_to_internal_invoke = None
+        self.last_effective_input = None
         self.last_context_in_internal_invoke = None
         self._invoke_side_effect = invoke_side_effect
 
     def _internal_invoke(self, input_data, context):
         self.invoke_call_count += 1
         self.last_input_to_internal_invoke = input_data
+        effective_input = self._normalize_input(input_data)
+        self.last_effective_input = effective_input
         self.last_context_in_internal_invoke = context
         if self._invoke_side_effect:
             if isinstance(self._invoke_side_effect, Exception):
                 raise self._invoke_side_effect
             # If callable, pass input_data and context
             if callable(self._invoke_side_effect):
-                return self._invoke_side_effect(input_data, context)
+                return self._invoke_side_effect(effective_input, context)
             return self._invoke_side_effect # If it's a direct value
-        return f"invoked_{self.name}_{str(input_data)[:20]}" # Make output somewhat dependent on input for clarity
+        return f"invoked_{self.name}_{str(effective_input)[:20]}" # Make output somewhat dependent on input for clarity
+
+    def _normalize_input(self, input_data: Any) -> Any:
+        if isinstance(input_data, dict):
+            if not input_data:
+                return NO_INPUT
+            if set(input_data.keys()) == {"_input"}:
+                return input_data["_input"]
+        return input_data
 
 class TestWorkflowGraph(unittest.TestCase):
     def test_add_node(self):
@@ -121,11 +133,11 @@ class TestCompiledGraph(unittest.TestCase):
         # Access the nodes from the compiled graph to check their state
         graph_node_a = compiled_graph.nodes["A"]
         graph_node_b = compiled_graph.nodes["B"]
-        self.assertEqual(graph_node_a.last_input_to_internal_invoke, "start_val")
-        self.assertEqual(graph_node_b.last_input_to_internal_invoke, "A_proc_start_val")
+        self.assertEqual(graph_node_a.last_effective_input, "start_val")
+        self.assertEqual(graph_node_b.last_effective_input, "A_proc_start_val")
 
         # Test context propagation
-        outer_ctx = ExecutionContext()
+        outer_ctx = InMemoryExecutionContext()
         # Create a new graph and compiled graph for this part of the test to ensure clean state
         graph2 = WorkflowGraph(name="ExecLinearCtx2")
         node_a_orig_for_ctx_test = GraphTestMockRunnable(name="A", invoke_side_effect=lambda d,c: f"A_proc_{d}")
@@ -140,8 +152,8 @@ class TestCompiledGraph(unittest.TestCase):
         graph2_node_a_copy = compiled_graph_2.nodes["A"]
         graph2_node_b_copy = compiled_graph_2.nodes["B"]
 
-        self.assertEqual(graph2_node_a_copy.last_input_to_internal_invoke, "ctx_val")
-        self.assertEqual(graph2_node_b_copy.last_input_to_internal_invoke, "A_proc_ctx_val")
+        self.assertEqual(graph2_node_a_copy.last_effective_input, "ctx_val")
+        self.assertEqual(graph2_node_b_copy.last_effective_input, "A_proc_ctx_val")
         
         internal_ctx_seen_by_b = graph2_node_b_copy.last_context_in_internal_invoke
         self.assertIsNotNone(internal_ctx_seen_by_b)
@@ -161,7 +173,7 @@ class TestCompiledGraph(unittest.TestCase):
         result = compiled_graph.invoke("start")
         # Access the node *copy* from the compiled graph
         graph_node_b_copy = compiled_graph.nodes["B"]
-        self.assertEqual(graph_node_b_copy.last_input_to_internal_invoke, 20)
+        self.assertEqual(graph_node_b_copy.last_effective_input, 20)
         self.assertEqual(result, "invoked_B_20")
 
     def test_execute_graph_multiple_outputs(self):
@@ -286,8 +298,35 @@ class TestCompiledGraph(unittest.TestCase):
         
         # Access the node *copy* from the compiled graph
         graph_node_c_copy = compiled_graph.nodes["C"]
-        self.assertEqual(graph_node_c_copy.last_input_to_internal_invoke, NO_INPUT)
+        self.assertEqual(graph_node_c_copy.last_effective_input, NO_INPUT)
         self.assertEqual(result, "C_fixed_out")
+
+
+class TestGraphSerialization(unittest.TestCase):
+    def test_pipeline_to_graph_roundtrip(self):
+        add_one = SimpleTask(lambda x: x + 1, name="AddOne")
+        mul_two = SimpleTask(lambda x: x * 2, name="MulTwo")
+        workflow = add_one | mul_two
+
+        graph = workflow.to_graph("PipelineGraph")
+        compiled = graph.compile()
+        self.assertEqual(compiled.invoke(3), 8)
+
+    def test_workflow_graph_json_roundtrip(self):
+        graph = WorkflowGraph(name="SerializableGraph")
+        node_a = graph.add_node(SimpleTask(lambda x: x + 1, name="OpA"))
+        node_b = graph.add_node(SimpleTask(lambda x: x * 5, name="OpB"))
+        graph.add_edge(node_a, node_b)
+        graph.set_entry_point(node_a).set_output_nodes([node_b])
+
+        data = graph.to_json()
+        registry = {
+            "OpA": lambda: SimpleTask(lambda x: x + 1, name="OpA"),
+            "OpB": lambda: SimpleTask(lambda x: x * 5, name="OpB"),
+        }
+        rebuilt = WorkflowGraph.from_json(data, registry)
+        compiled = rebuilt.compile()
+        self.assertEqual(compiled.invoke(2), (2 + 1) * 5)
 
 if __name__ == '__main__':
     unittest.main(verbosity=2)

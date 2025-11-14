@@ -4,7 +4,7 @@ from typing import Any, Callable, Optional, Dict, List, Tuple, Set, Union
 from collections import deque
 
 # Assuming runnables.py is in the same directory or accessible via PYTHONPATH
-from .runnables import Runnable, ExecutionContext, NO_INPUT, SimpleTask
+from .runnables import Runnable, ExecutionContext, InMemoryExecutionContext, NO_INPUT, SimpleTask
 # To allow CompiledGraph to be an AsyncRunnable if desired, or to call invoke_async
 from .async_runnables import AsyncRunnable 
 
@@ -74,6 +74,58 @@ class WorkflowGraph:
                 raise ValueError(f"Node '{name}' not found, cannot set as output node in graph '{self.name}'.")
         self.output_node_names = list(node_names) 
         return self
+
+    def to_json(self) -> Dict[str, Any]:
+        nodes_payload = [
+            {
+                "name": node_name,
+                "ref": node_name,
+                "type": runnable.__class__.__name__
+            }
+            for node_name, runnable in self.nodes.items()
+        ]
+
+        edges_payload: List[Dict[str, str]] = []
+        for source, destinations in self.edges.items():
+            for dest, mapper in destinations:
+                if mapper is not None:
+                    raise ValueError("WorkflowGraph.to_json currently does not support serializing input_mapper functions.")
+                edges_payload.append({"source": source, "dest": dest})
+
+        return {
+            "name": self.name,
+            "nodes": nodes_payload,
+            "edges": edges_payload,
+            "entry_points": list(self.entry_points),
+            "output_nodes": list(self.output_node_names),
+        }
+
+    @classmethod
+    def from_json(cls, json_data: Dict[str, Any], registry: Dict[str, Runnable]) -> 'WorkflowGraph':
+        graph = cls(name=json_data.get("name"))
+
+        for node_spec in json_data.get("nodes", []):
+            node_name = node_spec["name"]
+            registry_key = node_spec.get("ref", node_name)
+            if registry_key not in registry:
+                raise KeyError(f"Node reference '{registry_key}' not found in registry.")
+            runnable_or_factory = registry[registry_key]
+            runnable_instance = runnable_or_factory() if callable(runnable_or_factory) and not isinstance(runnable_or_factory, Runnable) else runnable_or_factory
+            graph.add_node(runnable_instance, node_name=node_name)
+
+        for edge_spec in json_data.get("edges", []):
+            if edge_spec.get("input_mapper") not in (None, "None"):
+                raise ValueError("WorkflowGraph.from_json currently does not support deserializing input_mapper references.")
+            graph.add_edge(edge_spec["source"], edge_spec["dest"])
+
+        for entry_name in json_data.get("entry_points", []):
+            graph.set_entry_point(entry_name)
+
+        output_nodes = json_data.get("output_nodes")
+        if output_nodes:
+            graph.set_output_nodes(output_nodes)
+
+        return graph
 
     def _get_topological_sort(self) -> List[str]:
         adj = {k: list(v) for k, v in self._adj.items()}
@@ -197,7 +249,7 @@ class CompiledGraph(Runnable): # Can also inherit AsyncRunnable if it implements
     def _internal_invoke(self, input_data: Any, context: ExecutionContext) -> Any:
         # This is the synchronous execution path
         logger.info(f"CompiledGraph '{self.name}' (from '{self.graph_def_name}'): Starting SYNC execution.")
-        internal_graph_context = ExecutionContext(initial_input=input_data, parent_context=context)
+        internal_graph_context = InMemoryExecutionContext(initial_input=input_data, parent_context=context)
         internal_graph_context.log_event(f"Graph '{self.name}': SYNC internal context created. Initial input type: {type(input_data).__name__}")
 
         for node_name in self.sorted_nodes:
@@ -218,7 +270,7 @@ class CompiledGraph(Runnable): # Can also inherit AsyncRunnable if it implements
     async def _internal_invoke_async(self, input_data: Any, context: ExecutionContext) -> Any:
         # This is the asynchronous execution path
         logger.info(f"CompiledGraph '{self.name}' (from '{self.graph_def_name}'): Starting ASYNC execution.")
-        internal_graph_context = ExecutionContext(initial_input=input_data, parent_context=context)
+        internal_graph_context = InMemoryExecutionContext(initial_input=input_data, parent_context=context)
         internal_graph_context.log_event(f"Graph '{self.name}': ASYNC internal context created. Initial input type: {type(input_data).__name__}")
 
         for node_name in self.sorted_nodes:
@@ -264,7 +316,7 @@ class CompiledGraph(Runnable): # Can also inherit AsyncRunnable if it implements
         # For simplicity in this modification, we'll directly call _internal_invoke_async.
         # A full implementation would mirror Runnable.invoke_async's features for the graph as a whole.
         
-        effective_context = context if context is not None else ExecutionContext(
+        effective_context = context if context is not None else InMemoryExecutionContext(
             initial_input=input_data if input_data is not NO_INPUT else None
         )
         

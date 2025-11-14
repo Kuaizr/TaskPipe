@@ -7,6 +7,7 @@ from typing import Any, Callable, Optional, Dict, List, Tuple, Union, Type, Coro
 
 from taskpipe import ( 
     ExecutionContext,
+    InMemoryExecutionContext,
     Runnable,
     SimpleTask,
     Pipeline,
@@ -34,6 +35,8 @@ class MockRunnable(Runnable):
         self.invoke_call_count += 1
         self.last_input_to_internal_invoke = input_data
         self.last_context_in_internal_invoke = context
+        effective_input = self._extract_effective_input(input_data)
+        self.last_effective_input = effective_input
         if self.delay > 0:
             time.sleep(self.delay) # Simulate blocking work for sync runnable
 
@@ -41,9 +44,9 @@ class MockRunnable(Runnable):
             if isinstance(self._invoke_side_effect, Exception):
                 raise self._invoke_side_effect
             if callable(self._invoke_side_effect):
-                return self._invoke_side_effect(input_data, context)
+                return self._invoke_side_effect(effective_input, context)
             return self._invoke_side_effect 
-        return f"invoked_{self.name}_{str(input_data)[:20]}" 
+        return f"invoked_{self.name}_{str(effective_input)[:20]}" 
 
     def __init__(self, name: Optional[str] = None, invoke_side_effect=None, check_side_effect=None, delay: float = 0, **kwargs):
         super().__init__(name=name, **kwargs) 
@@ -52,6 +55,7 @@ class MockRunnable(Runnable):
         self._invoke_side_effect = invoke_side_effect
         self._check_side_effect = check_side_effect 
         self.last_input_to_internal_invoke = None
+        self.last_effective_input = None
         self.last_context_in_internal_invoke = None
         self.last_input_to_default_check = None
         self.delay = delay # Added delay for testing invoke_async
@@ -62,6 +66,14 @@ class MockRunnable(Runnable):
         if self._check_side_effect: # For custom check behavior in tests
             return self._check_side_effect(data_from_invoke)
         return bool(data_from_invoke)
+
+    def _extract_effective_input(self, input_data: Any) -> Any:
+        if isinstance(input_data, dict):
+            if not input_data:
+                return NO_INPUT
+            if set(input_data.keys()) == {"_input"}:
+                return input_data["_input"]
+        return input_data
 
 # A simple AsyncRunnable for testing interactions
 class MockAsyncRunnableForSyncTest(AsyncRunnable):
@@ -74,7 +86,8 @@ class MockAsyncRunnableForSyncTest(AsyncRunnable):
     async def _internal_invoke_async(self, input_data: Any, context: ExecutionContext) -> Any:
         self.invoke_count += 1
         await asyncio.sleep(self.delay)
-        return f"{self.result_val}_for_{input_data}"
+        normalized_input = self._unwrap_input_payload(input_data)
+        return f"{self.result_val}_for_{normalized_input}"
 
 
 class TestRunnableBase(unittest.TestCase):
@@ -94,7 +107,7 @@ class TestRunnableBase(unittest.TestCase):
         # Patch the 'invoke' method of this specific instance
         with patch.object(task, 'invoke', new=mock_sync_invoke_method) as patched_invoke:
             async def run_test():
-                ctx = ExecutionContext()
+                ctx = InMemoryExecutionContext()
                 result = await task.invoke_async("async_input", context=ctx)
                 return result
 
@@ -110,7 +123,7 @@ class TestRunnableBase(unittest.TestCase):
         task._default_check = MagicMock(return_value=True) # Mock the actual check logic
 
         async def run_test():
-            ctx = ExecutionContext()
+            ctx = InMemoryExecutionContext()
             # data_from_invoke is "some_data"
             result = await task.check_async("some_data", context=ctx) 
             return result
@@ -163,6 +176,27 @@ class TestRunnableBase(unittest.TestCase):
         # run self.check (which uses _custom_check_fn) in an executor.
         self.assertFalse(asyncio.run(run_test()))
 
+    def test_invoke_merges_context_and_direct_inputs(self):
+        ctx = InMemoryExecutionContext()
+        ctx.add_output("source_a", "ctx_val")
+        mock = MockRunnable(name="MergeTarget", input_declaration={"from_ctx": "source_a"})
+        result = mock.invoke("direct_value", ctx)
+        self.assertTrue(result.startswith("invoked_MergeTarget_"))
+        self.assertEqual(
+            mock.last_input_to_internal_invoke,
+            {"from_ctx": "ctx_val", "_input": "direct_value"}
+        )
+
+    def test_simple_task_injects_context_parameter(self):
+        ctx = InMemoryExecutionContext()
+        ctx.add_output("flag", "CTX_FLAG")
+
+        def consumer(_input, context):
+            return f"{_input}-{context.get_output('flag')}"
+
+        task = SimpleTask(consumer, name="CtxTask")
+        self.assertEqual(task.invoke("value_data", ctx), "value_data-CTX_FLAG")
+
 
     # --- Existing tests like caching, retry, error_handler, input_declaration, copy ---
     # These should ideally be re-verified or adapted if their interaction with async changes,
@@ -183,7 +217,7 @@ class TestRunnableBase(unittest.TestCase):
         error_handler = MockRunnable(name="handler", invoke_side_effect=handler_fn)
         
         failing_runnable.on_error(error_handler)
-        ctx = ExecutionContext()
+        ctx = InMemoryExecutionContext()
         result = failing_runnable.invoke("input_to_fail", ctx)
         
         self.assertEqual(result, "handler_output")
@@ -202,7 +236,7 @@ class TestSyncComposersWithAsyncRunnables(unittest.TestCase):
         pipeline = ar1 | sr2
         self.assertIsInstance(pipeline, AsyncPipeline) # Ensure it's an AsyncPipeline
 
-        context = ExecutionContext()
+        context = InMemoryExecutionContext()
         start_time = time.time()
         result = pipeline.invoke("start_val", context) # Sync invoke on AsyncPipeline
         duration = time.time() - start_time
@@ -231,7 +265,7 @@ class TestSyncComposersWithAsyncRunnables(unittest.TestCase):
         conditional = ar_cond % sr_true >> sr_false
         self.assertIsInstance(conditional, AsyncConditional)
 
-        context = ExecutionContext()
+        context = InMemoryExecutionContext()
         result = conditional.invoke("cond_input", context)
 
         self.assertEqual(ar_cond.invoke_count, 1)
@@ -240,30 +274,30 @@ class TestSyncComposersWithAsyncRunnables(unittest.TestCase):
         self.assertEqual(result, "true_branch_got_use_true_for_cond_input")
 
 
-class TestExecutionContext(unittest.TestCase):
+class TestInMemoryExecutionContext(unittest.TestCase):
     def test_initialization(self):
-        ctx = ExecutionContext("initial_data")
+        ctx = InMemoryExecutionContext("initial_data")
         self.assertEqual(ctx.initial_input, "initial_data")
         self.assertEqual(ctx.node_outputs, {})
 
     def test_add_get_output(self):
-        ctx = ExecutionContext()
+        ctx = InMemoryExecutionContext()
         ctx.add_output("node_A", "output_A")
         self.assertEqual(ctx.get_output("node_A"), "output_A")
         self.assertIsNone(ctx.get_output("node_B"))
         self.assertEqual(ctx.get_output("node_B", "default_B"), "default_B")
 
     def test_add_output_unnamed_node(self):
-        ctx = ExecutionContext()
+        ctx = InMemoryExecutionContext()
         ctx.add_output("", "output_unnamed") # Should not add to node_outputs
         self.assertEqual(len(ctx.node_outputs), 0)
         self.assertTrue(any("Output for unnamed node" in event for event in ctx.event_log))
 
     def test_parent_context_get_output(self):
-        parent_ctx = ExecutionContext()
+        parent_ctx = InMemoryExecutionContext()
         parent_ctx.add_output("parent_node", "parent_value")
         
-        child_ctx = ExecutionContext(parent_context=parent_ctx)
+        child_ctx = InMemoryExecutionContext(parent_context=parent_ctx)
         child_ctx.add_output("child_node", "child_value")
 
         self.assertEqual(child_ctx.get_output("child_node"), "child_value")
@@ -287,12 +321,12 @@ class TestSimpleTask(unittest.TestCase):
 
     def test_input_declaration_with_simple_task(self):
         task = SimpleTask(lambda data: f"processed_{data}", input_declaration="in_src")
-        ctx = ExecutionContext(); ctx.add_output("in_src", "ctx_data")
+        ctx = InMemoryExecutionContext(); ctx.add_output("in_src", "ctx_data")
         self.assertEqual(task.invoke(context=ctx), "processed_ctx_data")
 
     def test_input_declaration_dict_with_simple_task(self):
         task = SimpleTask(lambda val1, val2: val1 + val2, input_declaration={"val1": "s1", "val2": "s2"})
-        ctx = ExecutionContext(); ctx.add_output("s1", 10); ctx.add_output("s2", 20)
+        ctx = InMemoryExecutionContext(); ctx.add_output("s1", 10); ctx.add_output("s2", 20)
         self.assertEqual(task.invoke(context=ctx), 30)
 
     def test_name_generation(self):
@@ -313,7 +347,7 @@ class TestPipeline(unittest.TestCase):
         pipeline = task1 | task2
         # self.assertEqual(pipeline.invoke(5), 12) # Removed first invoke without context
         
-        ctx = ExecutionContext()
+        ctx = InMemoryExecutionContext()
         pipeline_result = pipeline.invoke(5, ctx) # Call only once with context
         
         # Check if outputs of individual named runnables within the pipeline are in context
@@ -366,7 +400,7 @@ class TestConditional(unittest.TestCase):
         true_r.invoke_call_count = 0 # Manually reset for this specific test structure
         false_r.invoke_call_count = 0 # Manually reset
 
-        ctx = ExecutionContext()
+        ctx = InMemoryExecutionContext()
         cond_result = op_cond.invoke("input_to_cond", ctx) # Call only once with context
         
         # Check if the condition node's output is in context
@@ -392,6 +426,21 @@ class TestConditional(unittest.TestCase):
         self.assertEqual(true_r.invoke_call_count, 0)
         self.assertEqual(false_r.invoke_call_count, 1)
 
+    def test_conditional_raises_when_async_check_present(self):
+        condition_r = MockRunnable(name="cond_async", invoke_side_effect="value_for_async_check")
+
+        async def async_checker(data):
+            return True
+
+        condition_r.set_check(async_checker)
+
+        true_r = MockRunnable(name="true_branch", invoke_side_effect="ok")
+        false_r = MockRunnable(name="false_branch", invoke_side_effect="not_ok")
+
+        cond = condition_r % true_r >> false_r
+        with self.assertRaisesRegex(RuntimeError, "Use AsyncConditional"):
+            cond.invoke("trigger")
+
 
 class TestParallelRunnables(unittest.TestCase):
     def test_branch_and_fan_in(self):
@@ -402,7 +451,7 @@ class TestParallelRunnables(unittest.TestCase):
 
         task_A = SimpleTask(lambda x: f"A_{x}", name="tA")
         pipeline = task_A | {"Ck": task_C, "Dk": task_D}
-        ctx = ExecutionContext()
+        ctx = InMemoryExecutionContext()
         res = pipeline.invoke("start", ctx)
         self.assertEqual(res, {"Ck": "C_A_start", "Dk": "D_A_start"})
         self.assertEqual(ctx.get_output("tA"), "A_start")
@@ -415,7 +464,7 @@ class TestParallelRunnables(unittest.TestCase):
         chain_B = SimpleTask(lambda d: f"ChB_{d}", name="ChB")
         source_par = SourceParallel({"Ar": chain_A, "Br": chain_B})
         
-        ctx = ExecutionContext(initial_input="init_workflow_in")
+        ctx = InMemoryExecutionContext(initial_input="init_workflow_in")
         res_ctx = source_par.invoke(context=ctx)
         self.assertEqual(res_ctx, {"Ar": "ChA_init_workflow_in", "Br": "ChB_init_workflow_in"})
         
@@ -428,6 +477,26 @@ class TestParallelRunnables(unittest.TestCase):
         branch_fan_in = BranchAndFanIn({"ok_b": task_ok, "fail_b": task_fail})
         with self.assertRaisesRegex(ValueError, "branch_err"):
             branch_fan_in.invoke("input")
+
+    def test_branch_fan_in_respects_input_declaration(self):
+        ctx_producer = SimpleTask(lambda: "ctx_value", name="CtxProducer")
+        transformer = SimpleTask(lambda _input: "direct_value", name="DirectInput")
+
+        direct_branch = SimpleTask(lambda value: f"direct_{value}", name="DirectBranch")
+        ctx_branch = SimpleTask(
+            lambda _input: f"ctx_{_input}",
+            name="CtxBranch",
+            input_declaration="CtxProducer"
+        )
+
+        branch = BranchAndFanIn({"direct": direct_branch, "ctx": ctx_branch})
+        workflow = ctx_producer | transformer | branch
+
+        ctx = InMemoryExecutionContext()
+        result = workflow.invoke(NO_INPUT, ctx)
+
+        self.assertEqual(result["direct"], "direct_direct_value")
+        self.assertEqual(result["ctx"], "ctx_ctx_value")
 
 
 class TestWhile(unittest.TestCase):
@@ -442,21 +511,21 @@ class TestWhile(unittest.TestCase):
         cond_r.set_check(lambda d: d < 3)
         
         # Body runnable increments its input
-        body_r = SimpleTask(lambda x: x + 1, name="wB")
+        body_r = SimpleTask(lambda last, **_: last + 1, name="wB")
         
         loop = While(cond_r, body_r, max_loops=5)
         
         # With corrected While logic, body receives previous body output
         self.assertEqual(loop.invoke(0), [1, 2, 3])
         
-        ctx = ExecutionContext(); loop.invoke(0, ctx)
+        ctx = InMemoryExecutionContext(); loop.invoke(0, ctx)
         self.assertEqual(ctx.get_output(loop.name), [1, 2, 3])
 
     def test_while_loop_max_loops_reached(self):
         # Condition: always true
         cond_r = SimpleTask(lambda x: True, name="alwaysT")
         # Body: increment input
-        body_r = SimpleTask(lambda x: x + 1, name="incrB")
+        body_r = SimpleTask(lambda last, **_: last + 1, name="incrB")
         
         # Max loops = 3. Initial input = 0.
         # Iter 1: cond(0) -> True. body(0) -> 1. current_input_for_iteration = 1. outputs = [1]
@@ -472,7 +541,7 @@ class TestWhile(unittest.TestCase):
         
         # Check event log for max_loops message
         # Use a fresh context to avoid cache issues affecting the log check
-        test_ctx = ExecutionContext() 
+        test_ctx = InMemoryExecutionContext() 
         while_loop.clear_cache() # Clear cache on the runnable itself
         while_loop.invoke(0, test_ctx)
         expected_log = f"Node '{while_loop.name}': Loop exited due to max_loops (3) reached."
@@ -486,6 +555,32 @@ class TestWhile(unittest.TestCase):
         self.assertEqual(loop.invoke(0), [])
         self.assertEqual(body_r.invoke_call_count, 0)
 
+    def test_while_loop_provides_structured_input(self):
+        cond_r = SimpleTask(lambda _input: _input if _input is not NO_INPUT else 0, name="wCond")
+        cond_r.set_check(lambda data: data < 3)
+
+        captured_payloads: List[Dict[str, Any]] = []
+
+        def body_func(last, history, iteration):
+            captured_payloads.append({
+                "last": last,
+                "history": list(history),
+                "iteration": iteration
+            })
+            return last + 1
+
+        body_r = SimpleTask(body_func, name="wBody")
+        loop = While(cond_r, body_r, max_loops=5)
+        results = loop.invoke(0)
+
+        self.assertEqual(results, [1, 2, 3])
+        self.assertEqual(
+            captured_payloads[0],
+            {"last": 0, "history": [], "iteration": 0}
+        )
+        self.assertEqual(captured_payloads[1]["history"], [1])
+        self.assertEqual(captured_payloads[2]["history"], [1, 2])
+
 
 class TestMergeInputs(unittest.TestCase):
     def test_merge_inputs_basic(self):
@@ -493,7 +588,7 @@ class TestMergeInputs(unittest.TestCase):
         merge_r = MergeInputs(
             {"uname": "nodeA_out", "icount": "nodeB_out"}, merger, name="merger"
         )
-        ctx = ExecutionContext()
+        ctx = InMemoryExecutionContext()
         ctx.add_output("nodeA_out", "Bob"); ctx.add_output("nodeB_out", 3)
         res = merge_r.invoke(context=ctx)
         self.assertEqual(res, "User Bob has 3 items.")
@@ -502,7 +597,7 @@ class TestMergeInputs(unittest.TestCase):
     def test_merge_inputs_missing_source_with_default_in_func(self):
         def merger(v1, v2=None): return f"{v1}-{v2}"
         merge_r = MergeInputs({"v1": "s1", "v2": "s_missing"}, merger)
-        ctx = ExecutionContext(); ctx.add_output("s1", "d1")
+        ctx = InMemoryExecutionContext(); ctx.add_output("s1", "d1")
         self.assertEqual(merge_r.invoke(context=ctx), "d1-None")
 
 

@@ -1,11 +1,13 @@
+import asyncio
+import time
 import unittest
 import logging
 from typing import Any
 from unittest.mock import MagicMock, ANY
 
 # Assuming runnables.py and graph.py are accessible
-from taskpipe import Runnable, SimpleTask, ExecutionContext, InMemoryExecutionContext, NO_INPUT, MergeInputs
-from taskpipe import WorkflowGraph, CompiledGraph
+from taskpipe import Runnable, SimpleTask, AsyncRunnable, ExecutionContext, InMemoryExecutionContext, NO_INPUT, MergeInputs
+from taskpipe import WorkflowGraph, CompiledGraph, RunnableRegistry
 
 # Suppress most logging output during tests
 # Configure specific loggers if needed for debugging
@@ -327,6 +329,66 @@ class TestGraphSerialization(unittest.TestCase):
         rebuilt = WorkflowGraph.from_json(data, registry)
         compiled = rebuilt.compile()
         self.assertEqual(compiled.invoke(2), (2 + 1) * 5)
+
+    def test_compiled_graph_execution_stages_and_parallel_async(self):
+        tracker = []
+
+        class RecorderTask(AsyncRunnable):
+            def __init__(self, name: str, delay: float = 0.05):
+                super().__init__(name=name)
+                self.delay = delay
+
+            async def _internal_invoke_async(self, input_data, context):
+                tracker.append((self.name, "start", time.perf_counter()))
+                await asyncio.sleep(self.delay)
+                tracker.append((self.name, "end", time.perf_counter()))
+                return self.name
+
+        graph = WorkflowGraph(name="AsyncParallel")
+        start = SimpleTask(lambda: "start", name="Start")
+        branch_a = RecorderTask("BranchA")
+        branch_b = RecorderTask("BranchB")
+        joiner = MergeInputs({"first": "BranchA", "second": "BranchB"}, lambda first, second: f"{first}+{second}", name="Joiner")
+
+        graph.add_node(start)
+        graph.add_node(branch_a)
+        graph.add_node(branch_b)
+        graph.add_node(joiner)
+        graph.add_edge("Start", "BranchA")
+        graph.add_edge("Start", "BranchB")
+        graph.add_edge("BranchA", "Joiner")
+        graph.add_edge("BranchB", "Joiner")
+
+        compiled = graph.compile()
+        self.assertGreaterEqual(len(compiled.execution_stages), 3)
+
+        asyncio.run(compiled.invoke_async(NO_INPUT))
+
+        starts = [event for event in tracker if event[1] == "start"]
+        self.assertEqual(len(starts), 2)
+        diff = abs(starts[0][2] - starts[1][2])
+        self.assertLess(diff, 0.2)  # Should start nearly simultaneously
+
+    def test_workflow_graph_from_json_with_registry(self):
+        registry = RunnableRegistry()
+        registry.register("Adder", lambda: SimpleTask(lambda x: x + 1, name="Adder"))
+        registry.register("Multiplier", lambda: SimpleTask(lambda x: x * 3, name="Multiplier"))
+
+        graph_json = {
+            "name": "RegistryGraph",
+            "nodes": [
+                {"name": "AdderNode", "ref": "Adder"},
+                {"name": "MultiplierNode", "ref": "Multiplier"}
+            ],
+            "edges": [
+                {"source": "AdderNode", "dest": "MultiplierNode"}
+            ],
+            "entry_points": ["AdderNode"],
+            "output_nodes": ["MultiplierNode"]
+        }
+
+        graph = WorkflowGraph.from_json(graph_json, registry)
+        self.assertEqual(graph.compile().invoke(1), (1 + 1) * 3)
 
 if __name__ == '__main__':
     unittest.main(verbosity=2)

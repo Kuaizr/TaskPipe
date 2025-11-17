@@ -33,6 +33,7 @@ from .graph import (
     WorkflowGraph,
     CompiledGraph
 )
+from .registry import RunnableRegistry
 
 # 可以定义 __all__ 来控制 from taskpipe import * 的行为
 __all__ = [
@@ -47,5 +48,6 @@ __all__ = [
     'AsyncPipeline', 'AsyncConditional', 'AsyncBranchAndFanIn','_AsyncPendingConditional',
     'AsyncSourceParallel', 'AsyncWhile', 'AgentLoop',
     # Graph components
-    'WorkflowGraph', 'CompiledGraph'
+    'WorkflowGraph', 'CompiledGraph',
+    'RunnableRegistry'
 ]

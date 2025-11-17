@@ -7,6 +7,7 @@ from collections import deque
 from .runnables import Runnable, ExecutionContext, InMemoryExecutionContext, NO_INPUT, SimpleTask
 # To allow CompiledGraph to be an AsyncRunnable if desired, or to call invoke_async
 from .async_runnables import AsyncRunnable 
+from .registry import RunnableRegistry
 
 
 logger = logging.getLogger(__name__)
@@ -101,16 +102,24 @@ class WorkflowGraph:
         }
 
     @classmethod
-    def from_json(cls, json_data: Dict[str, Any], registry: Dict[str, Runnable]) -> 'WorkflowGraph':
+    def from_json(cls, json_data: Dict[str, Any], registry: Union[Dict[str, Union[Runnable, Callable[[], Runnable]]], RunnableRegistry]) -> 'WorkflowGraph':
         graph = cls(name=json_data.get("name"))
 
         for node_spec in json_data.get("nodes", []):
             node_name = node_spec["name"]
             registry_key = node_spec.get("ref", node_name)
-            if registry_key not in registry:
+            if isinstance(registry, RunnableRegistry):
+                runnable_instance = registry.get(registry_key)
+            else:
+                if registry_key not in registry:
+                    raise KeyError(f"Node reference '{registry_key}' not found in registry.")
+                runnable_or_factory = registry[registry_key]
+                if callable(runnable_or_factory) and not isinstance(runnable_or_factory, Runnable):
+                    runnable_instance = runnable_or_factory()
+                else:
+                    runnable_instance = runnable_or_factory
+            if not isinstance(runnable_instance, Runnable):
                 raise KeyError(f"Node reference '{registry_key}' not found in registry.")
-            runnable_or_factory = registry[registry_key]
-            runnable_instance = runnable_or_factory() if callable(runnable_or_factory) and not isinstance(runnable_or_factory, Runnable) else runnable_or_factory
             graph.add_node(runnable_instance, node_name=node_name)
 
         for edge_spec in json_data.get("edges", []):
@@ -151,6 +160,27 @@ class WorkflowGraph:
             )
         return sorted_nodes
 
+    def _get_execution_stages(self, sorted_nodes: List[str]) -> List[List[str]]:
+        in_degree = {node: self._in_degree.get(node, 0) for node in self.nodes.keys()}
+        ready = [node for node in sorted_nodes if in_degree.get(node, 0) == 0]
+        stages: List[List[str]] = []
+        visited = set()
+        while ready:
+            stage_nodes = sorted(ready, key=lambda n: sorted_nodes.index(n))
+            stages.append(stage_nodes)
+            next_ready: List[str] = []
+            for node in stage_nodes:
+                visited.add(node)
+                for child, _ in self.edges.get(node, []):
+                    in_degree[child] = max(0, in_degree.get(child, 0) - 1)
+                    if in_degree[child] == 0:
+                        next_ready.append(child)
+            ready = next_ready
+        if len(visited) != len(self.nodes):
+            missing = set(self.nodes.keys()) - visited
+            raise Exception(f"Failed to build execution stages, unvisited nodes: {missing}")
+        return stages
+
     def compile(self) -> 'CompiledGraph':
         if not self.nodes:
             raise ValueError(f"Graph '{self.name}' has no nodes, cannot compile.")
@@ -180,7 +210,8 @@ class WorkflowGraph:
             entry_point_names=effective_entry_points,
             output_node_names=effective_output_nodes,
             graph_definition_name=self.name,
-            use_cache = self.use_cache
+            use_cache = self.use_cache,
+            execution_stages=self._get_execution_stages(sorted_node_names)
         )
 
 
@@ -197,6 +228,7 @@ class CompiledGraph(Runnable): # Can also inherit AsyncRunnable if it implements
                  entry_point_names: List[str],
                  output_node_names: List[str],
                  graph_definition_name: str,
+                 execution_stages: Optional[List[List[str]]] = None,
                  **kwargs): 
         super().__init__(name=name, **kwargs) # Runnable's __init__
         self.nodes: Dict[str, Runnable] = nodes_map
@@ -205,6 +237,7 @@ class CompiledGraph(Runnable): # Can also inherit AsyncRunnable if it implements
         self.entry_points: List[str] = entry_point_names
         self.output_nodes: List[str] = output_node_names
         self.graph_def_name: str = graph_definition_name 
+        self.execution_stages: List[List[str]] = execution_stages or [sorted_node_names]
 
         self._node_parents_info: Dict[str, List[Tuple[str, Optional[Callable]]]] = {n: [] for n in self.nodes}
         for source_name, destinations in self.edges.items():
@@ -252,18 +285,19 @@ class CompiledGraph(Runnable): # Can also inherit AsyncRunnable if it implements
         internal_graph_context = InMemoryExecutionContext(initial_input=input_data, parent_context=context)
         internal_graph_context.log_event(f"Graph '{self.name}': SYNC internal context created. Initial input type: {type(input_data).__name__}")
 
-        for node_name in self.sorted_nodes:
-            node_runnable = self.nodes[node_name]
-            internal_graph_context.log_event(f"Graph '{self.name}': SYNC Processing node '{node_name}' (type: {type(node_runnable).__name__}).")
-            
-            current_node_input = self._prepare_node_input(node_name, input_data, internal_graph_context)
-
-            try:
-                node_runnable.invoke(current_node_input, internal_graph_context) # SYNC invoke
-            except Exception as e:
-                logger.error(f"CompiledGraph '{self.name}': SYNC Error executing node '{node_name}': {e}", exc_info=True)
-                internal_graph_context.log_event(f"Graph '{self.name}', Node '{node_name}': SYNC FAILED with {type(e).__name__}: {str(e)[:100]}.")
-                raise e
+        for stage in self.execution_stages:
+            for node_name in stage:
+                node_runnable = self.nodes[node_name]
+                internal_graph_context.log_event(f"Graph '{self.name}': SYNC Processing node '{node_name}' (type: {type(node_runnable).__name__}).")
+                
+                current_node_input = self._prepare_node_input(node_name, input_data, internal_graph_context)
+                
+                try:
+                    node_runnable.invoke(current_node_input, internal_graph_context) # SYNC invoke
+                except Exception as e:
+                    logger.error(f"CompiledGraph '{self.name}': SYNC Error executing node '{node_name}': {e}", exc_info=True)
+                    internal_graph_context.log_event(f"Graph '{self.name}', Node '{node_name}': SYNC FAILED with {type(e).__name__}: {str(e)[:100]}.")
+                    raise e
 
         return self._collect_final_results(internal_graph_context)
 
@@ -273,18 +307,26 @@ class CompiledGraph(Runnable): # Can also inherit AsyncRunnable if it implements
         internal_graph_context = InMemoryExecutionContext(initial_input=input_data, parent_context=context)
         internal_graph_context.log_event(f"Graph '{self.name}': ASYNC internal context created. Initial input type: {type(input_data).__name__}")
 
-        for node_name in self.sorted_nodes:
-            node_runnable = self.nodes[node_name]
-            internal_graph_context.log_event(f"Graph '{self.name}': ASYNC Processing node '{node_name}' (type: {type(node_runnable).__name__}).")
+        for stage in self.execution_stages:
+            stage_tasks = []
+            for node_name in stage:
+                node_runnable = self.nodes[node_name]
+                internal_graph_context.log_event(f"Graph '{self.name}': ASYNC Processing node '{node_name}' (type: {type(node_runnable).__name__}).")
 
-            current_node_input = self._prepare_node_input(node_name, input_data, internal_graph_context)
-            
-            try:
-                await node_runnable.invoke_async(current_node_input, internal_graph_context) # ASYNC invoke_async
-            except Exception as e:
-                logger.error(f"CompiledGraph '{self.name}': ASYNC Error executing node '{node_name}': {e}", exc_info=True)
-                internal_graph_context.log_event(f"Graph '{self.name}', Node '{node_name}': ASYNC FAILED with {type(e).__name__}: {str(e)[:100]}.")
-                raise
+                current_node_input = self._prepare_node_input(node_name, input_data, internal_graph_context)
+                stage_tasks.append((node_name, node_runnable.invoke_async(current_node_input, internal_graph_context)))
+
+            if stage_tasks:
+                try:
+                    await asyncio.gather(*(task for _, task in stage_tasks))
+                except Exception as e:
+                    failed_nodes = [name for name, _ in stage_tasks]
+                    logger.error(f"CompiledGraph '{self.name}': ASYNC Error executing stage {failed_nodes}: {e}", exc_info=True)
+                    for failing_name in failed_nodes:
+                        internal_graph_context.log_event(
+                            f"Graph '{self.name}', Node '{failing_name}': ASYNC FAILED due to stage error {type(e).__name__}: {str(e)[:100]}."
+                        )
+                    raise
         
         return self._collect_final_results(internal_graph_context)
 

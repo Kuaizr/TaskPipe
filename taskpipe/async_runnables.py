@@ -32,6 +32,7 @@ class AsyncRunnable(Runnable):
             initial_input=input_data if input_data is not NO_INPUT else None)
 
         prepared_input_for_invoke = await self._prepare_input_payload_async(input_data, effective_context)
+        self._emit_node_status(effective_context, "start")
         cache_key = None # Initialize
         if self.use_cache:
             cache_key = self._get_cache_key(prepared_input_for_invoke, effective_context)
@@ -40,6 +41,7 @@ class AsyncRunnable(Runnable):
                 result = self._invoke_cache[cache_key]
                 if self.name and effective_context: # Ensure effective_context is not None (it won't be here)
                     effective_context.add_output(self.name, result)
+                self._emit_node_status(effective_context, "success")
                 return result
         
         if not self.use_cache: # Log if caching is disabled
@@ -60,7 +62,9 @@ class AsyncRunnable(Runnable):
                 f"Input type: {type(prepared_input_for_invoke).__name__}")
 
             try:
-                result = await self._internal_invoke_async(prepared_input_for_invoke, effective_context)
+                execution_input_payload = self._apply_input_model(prepared_input_for_invoke)
+                result_raw = await self._internal_invoke_async(execution_input_payload, effective_context)
+                result = self._apply_output_model(result_raw)
                 if self.use_cache and cache_key is not None: 
                     self._invoke_cache[cache_key] = result
                 effective_context.log_event(
@@ -69,6 +73,7 @@ class AsyncRunnable(Runnable):
                 
                 if self.name:
                     effective_context.add_output(self.name, result)
+                self._emit_node_status(effective_context, "success")
                 return result
 
             except Exception as e:
@@ -94,10 +99,14 @@ class AsyncRunnable(Runnable):
                                     f"Node '{self.name}': Async error handler "
                                     f"'{getattr(self._error_handler, 'name', 'UnnamedErrorHandler')}' executed.")
                                 if self.name:
-                                    effective_context.add_output(self.name, error_handler_output)
+                                    adjusted_output = self._apply_output_model(error_handler_output)
+                                    effective_context.add_output(self.name, adjusted_output)
+                                else:
+                                    adjusted_output = self._apply_output_model(error_handler_output)
                                 if self.use_cache and cache_key is not None: # <<< MODIFIED: Check use_cache
-                                    self._invoke_cache[cache_key] = error_handler_output
-                                return error_handler_output
+                                    self._invoke_cache[cache_key] = adjusted_output
+                                self._emit_node_status(effective_context, "success")
+                                return adjusted_output
                             else:
                                 effective_context.log_event(f"Node '{self.name}': Error handler is not a Runnable, cannot invoke_async. Raising original error.")
                                 raise e # Re-raise original error if handler is not Runnable
@@ -106,7 +115,9 @@ class AsyncRunnable(Runnable):
                                 f"Node '{self.name}': Async error handler "
                                 f"'{getattr(self._error_handler, 'name', 'UnnamedErrorHandler')}' also failed: "
                                 f"{type(eh_e).__name__}: {eh_e}")
+                            self._emit_node_status(effective_context, "failed", {"exception": type(e).__name__})
                             raise e from eh_e # Re-raise original error, with error handler's error as context
+                    self._emit_node_status(effective_context, "failed", {"exception": type(e).__name__})
                     raise e # Re-raise original error if no error_handler or if it wasn't a Runnable
                 
                 effective_context.log_event(
@@ -116,8 +127,10 @@ class AsyncRunnable(Runnable):
         
         # This part is reached if all retry attempts fail and the last exception was not handled or re-raised
         if last_exception is not None:
+            self._emit_node_status(effective_context, "failed", {"exception": type(last_exception).__name__})
             raise last_exception
         else:
+            self._emit_node_status(effective_context, "failed", {"exception": "Unknown"})
             raise RuntimeError(f"AsyncRunnable '{self.name}': Exited retry loop unexpectedly without result or exception.")
 
     async def _context_inputs_from_declaration_async(self, context: Optional[ExecutionContext]) -> Dict[str, Any]:

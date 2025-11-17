@@ -15,6 +15,8 @@ TaskPipe 是一个 Python 框架，用于构建、组合和执行复杂的工作
     * `source_task | {"branch1": task_b, "branch2": task_c}`: 将 `source_task` 的输出扇出到多个并行分支 `task_b` 和 `task_c`。结果是 `BranchAndFanIn` (或 `AsyncBranchAndFanIn`) 作为流水线的下一步。
     * `SourceParallel({"branch1": task_a, "branch2": task_b})`: 从共同的（或无）输入并行运行多个任务或流水线。
 * **执行上下文 (`ExecutionContext`)**: `ExecutionContext` 现在是一个协议（接口），默认实现 `InMemoryExecutionContext` 在工作流执行期间流动，允许任务之间共享数据、访问先前执行任务的输出，并记录事件。你也可以实现 `RedisExecutionContext` / `DatabaseExecutionContext` 以满足持久化与分布式需求。
+* **Pydantic 数据契约**：可为任意 `Runnable` 声明 `InputModel` / `OutputModel` / `ConfigModel`（Pydantic 模型）。当声明后，taskpipe 会在执行前自动校验输入、在执行后校验输出，并将配置 (`config`) 序列化为结构化数据——这让复杂的分支/并行工作流更安全。
+* **节点状态回调**：`ExecutionContext.notify_status`（默认由 `InMemoryExecutionContext` 提供）会收到 “start / success / failed” 事件，便于 UI 或监控订阅节点状态。
 * **AgentLoop / 动态 Agent**: 在 `AsyncRunnable` 家族中新增 `AgentLoop`，可封装经典的 ReAct/Tool-Calling 循环：生成器 `Runnable` 可以动态返回“下一步任务”并在事件循环中继续执行，直到返回最终结果。
 * **缓存**: 内置支持对 `Runnable` 的 `invoke`/`invoke_async` 和 `check`/`check_async` 方法的结果进行缓存，以加速重复执行和条件判断。
 * **错误处理与重试**:
@@ -23,8 +25,9 @@ TaskPipe 是一个 Python 框架，用于构建、组合和执行复杂的工作
 * **生命周期钩子**:
     * 新增 `on_start` 和 `on_complete` 生命周期钩子，允许用户在任务执行的关键阶段（开始前和完成后）注入自定义逻辑。
     * 这些钩子（包括增强后的 `on_error`）都可以接受 `Runnable` 实例或普通可调用函数作为处理器，为日志记录、资源管理、监控和通知等场景提供了极大的灵活性。
-* **基于图的定义 (可选)**: 对于更复杂或需要集中管理的工作流，可以使用 `WorkflowGraph` 以声明方式定义节点和边，然后将其编译为可执行的 `CompiledGraph`。`CompiledGraph` 同样支持同步和异步执行。**需要注意的是，当一个包含异步节点的 `CompiledGraph` 通过其同步方法 `compiled_graph.invoke()` 执行时，图中的每个异步节点会通过 `AsyncRunnable._internal_invoke -> asyncio.run()` 的路径被依次、同步地执行，这会失去这些异步节点之间潜在的并发性。通过 `await compiled_graph.invoke_async()` 执行时，则能很好地利用 `asyncio` 的并发能力。**
-* **图 ↔ 代码 双向转换**: 任意 `Runnable`（例如通过 `|` 操作符构建的“PyTorch 风格”流水线）都可以调用 `.to_graph()` 导出为 `WorkflowGraph`，而 `WorkflowGraph.from_json()` / `WorkflowGraph.to_json()` 允许平台化场景进行持久化、可视化与低代码集成。目前示例脚本会将导出的 JSON 保存到 `examples/numbers_workflow.json`，便于直接加载或上传。
+* **基于图的定义 (可选)**: 对于更复杂或需要集中管理的工作流，可以使用 `WorkflowGraph` 以声明方式定义节点和边，然后将其编译为可执行的 `CompiledGraph`。`CompiledGraph` 同样支持同步和异步执行，并且在异步执行时会按照自动计算的“执行阶段”并发运行同一阶段中互不依赖的节点。
+* **RunnableRegistry**： taskpipe 内置轻量级注册表，应用层可以集中注册可用的 `Runnable`，`WorkflowGraph.from_json` 可以直接使用该注册表来反序列化节点。
+* **图 ↔ 代码 双向转换**: 任意 `Runnable`（例如通过 `|` 操作符构建的“PyTorch 风格”流水线）都可以调用 `.to_graph()` 导出为 `WorkflowGraph`，而 `WorkflowGraph.from_json()` / `WorkflowGraph.to_json()` 允许平台化场景进行持久化、可视化与低代码集成。示例脚本会将导出的 JSON 保存到 `examples/registry_workflow.json`，便于直接加载或上传。
 * **可扩展性**: 用户可以轻松创建自己的、继承自 `Runnable` 或 `AsyncRunnable` 的自定义任务类型，以封装特定的业务逻辑。
 * **明确的调用约定**:
     * 当从**同步代码**中调用工作流或 `Runnable` 时，使用其 `.invoke()` 方法。如果 `Runnable` 是异步的，其 `.invoke()` 方法内部通常会使用 `asyncio.run()` 来执行异步逻辑（注意：这不能在已运行的事件循环中调用）。
@@ -60,6 +63,43 @@ pip install -e .
 ````
 
 这将把 `taskpipe` 包链接到你的 Python 环境中，使其可以像其他已安装的库一样被导入，同时你对源代码的任何修改都会立即生效。
+
+## Pydantic Schema 示例
+
+```python
+from pydantic import BaseModel
+from taskpipe import Runnable
+
+class EmailInput(BaseModel):
+    subject: str
+    body: str
+
+class EmailOutput(BaseModel):
+    status: str
+
+class EmailConfig(BaseModel):
+    smtp_server: str
+
+class SendEmail(Runnable):
+    InputModel = EmailInput
+    OutputModel = EmailOutput
+    ConfigModel = EmailConfig
+
+    def _internal_invoke(self, input_data: EmailInput, context):
+        # input_data 已经是 Pydantic 对象
+        ...  # 实际发送邮件
+        return {"status": "sent"}
+
+task = SendEmail(config={"smtp_server": "smtp.example.com"})
+result = task.invoke({"subject": "Hi", "body": "..."})
+assert result.status == "sent"
+```
+
+## 示例 (`examples/` 目录)
+
+- `pipeline_with_schema.py`：类型安全的指标评估流水线，展示 `InputModel`/`OutputModel`/`ConfigModel` 与节点状态事件。
+- `parallel_report_workflow.py`：使用 `WorkflowGraph` 构建带并行阶段的异步日报任务，展示 `CompiledGraph.execution_stages`。
+- `registry_serialization.py`：演示如何用 `RunnableRegistry` 导出/导入图定义 (`registry_workflow.json`) 并再次执行。
 
 ## TaskPipe 的适用场景与边界
 

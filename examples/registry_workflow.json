@@ -1,0 +1,36 @@
+{
+  "name": "MetricIngestion",
+  "nodes": [
+    {
+      "name": "CollectMetrics",
+      "ref": "CollectMetrics",
+      "type": "SimpleTask"
+    },
+    {
+      "name": "NormalizeMetrics",
+      "ref": "NormalizeMetrics",
+      "type": "SimpleTask"
+    },
+    {
+      "name": "PersistResult",
+      "ref": "PersistResult",
+      "type": "SimpleTask"
+    }
+  ],
+  "edges": [
+    {
+      "source": "CollectMetrics",
+      "dest": "NormalizeMetrics"
+    },
+    {
+      "source": "NormalizeMetrics",
+      "dest": "PersistResult"
+    }
+  ],
+  "entry_points": [
+    "CollectMetrics"
+  ],
+  "output_nodes": [
+    "PersistResult"
+  ]
+}

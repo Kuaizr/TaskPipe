@@ -6,12 +6,15 @@ import pickle
 import asyncio # Added for invoke_async
 import inspect
 from typing import Any, Callable, Optional, Dict, List, Tuple, Union, Type, Coroutine
+from typing import Any, Callable, Optional, Dict, List, Tuple, Union, Type, Coroutine
+from typing import TypeVar, cast
 
 try:
     from typing import Protocol, runtime_checkable
 except ImportError:
     from typing_extensions import Protocol, runtime_checkable
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from pydantic import BaseModel, ValidationError
 
 # 用于标记没有显式输入的情况
 NO_INPUT = object()
@@ -43,6 +46,7 @@ class InMemoryExecutionContext:
         self.initial_input: Any = initial_input
         self.event_log: List[str] = []
         self.parent_context: Optional[ExecutionContext] = parent_context
+        self.node_status_events: List[Dict[str, Any]] = []
 
     def add_output(self, node_name: str, value: Any):
         if node_name:
@@ -63,6 +67,15 @@ class InMemoryExecutionContext:
         full_message = f"[{timestamp}] {message}"
         logger.debug(f"ContextEvent: {message}")
         self.event_log.append(full_message)
+
+    def notify_status(self, node_name: str, status: str, metadata: Optional[Dict[str, Any]] = None) -> None:
+        event_payload = {
+            "node": node_name,
+            "status": status,
+            "metadata": metadata or {},
+            "timestamp": time.time()
+        }
+        self.node_status_events.append(event_payload)
 
     def __repr__(self) -> str:
         return f"<InMemoryExecutionContext id={id(self)} initial_input={str(self.initial_input)[:60]}, node_outputs_keys={list(self.node_outputs.keys())}>"
@@ -104,15 +117,25 @@ def _default_cache_key_generator(runnable_name: str, input_data: Any, context: O
         return object()
 
 
+ConfigModelType = TypeVar("ConfigModelType", bound=BaseModel)
+InputModelType = TypeVar("InputModelType", bound=BaseModel)
+OutputModelType = TypeVar("OutputModelType", bound=BaseModel)
+
+
 class Runnable(abc.ABC):
     """
     系统的基本构建块。每个 Runnable 代表工作流中的一个操作或步骤。
     """
+    InputModel: Optional[Type[InputModelType]] = None
+    OutputModel: Optional[Type[OutputModelType]] = None
+    ConfigModel: Optional[Type[ConfigModelType]] = None
+
     def __init__(self,
                  name: Optional[str] = None,
                  input_declaration: Any = None,
                  cache_key_generator: Optional[Callable[[str, Any, Optional[ExecutionContext], Any], Any]] = None,
-                 use_cache: bool = False): # <<< NEW PARAMETER, defaulting to False
+                 use_cache: bool = False,
+                 config: Optional[Union[BaseModel, Dict[str, Any]]] = None): # <<< NEW PARAMETER, defaulting to False
         self.name: str = name if name else f"{self.__class__.__name__}_{id(self)}"
         if not isinstance(self.name, str) or not self.name:
             self.name = f"{self.__class__.__name__}_{id(self)}"
@@ -131,6 +154,32 @@ class Runnable(abc.ABC):
 
         self._on_start_handler: Optional[Union['Runnable', Callable[[ExecutionContext, Any], None]]] = None
         self._on_complete_handler: Optional[Union['Runnable', Callable[[ExecutionContext, Any, Optional[Exception]], None]]] = None
+        self.config = self._initialize_config(config)
+    def _initialize_config(self, config_data: Optional[Union[BaseModel, Dict[str, Any]]]) -> Any:
+        config_cls = getattr(self, "ConfigModel", None)
+        if config_cls is None:
+            return config_data
+        if config_data is None:
+            return config_cls()
+        if isinstance(config_data, config_cls):
+            return config_data
+        if isinstance(config_data, dict):
+            try:
+                return config_cls(**config_data)
+            except ValidationError as exc:
+                raise ValueError(f"Runnable '{self.name}' config validation failed: {exc}") from exc
+        raise TypeError(f"Config for Runnable '{self.name}' must be dict or {config_cls.__name__}")
+
+    def get_config(self) -> Any:
+        return self.config
+
+    def get_config_dict(self) -> Optional[Dict[str, Any]]:
+        if isinstance(self.config, BaseModel):
+            return cast(BaseModel, self.config).dict()
+        if isinstance(self.config, dict):
+            return dict(self.config)
+        return None
+
 
     def _context_inputs_from_declaration(self, context: Optional[ExecutionContext]) -> Dict[str, Any]:
         if not self.input_declaration or context is None:
@@ -213,12 +262,55 @@ class Runnable(abc.ABC):
     def get_error_handler(self) -> Optional[Union['Runnable', Callable[[ExecutionContext, Any, Exception], Any]]]:
         return self._error_handler
 
+    def _apply_input_model(self, payload: Any) -> Any:
+        input_model_cls = getattr(self, "InputModel", None)
+        if input_model_cls is None:
+            return payload
+        try:
+            if payload is NO_INPUT:
+                payload = {}
+            if isinstance(payload, input_model_cls):
+                return payload
+            if isinstance(payload, dict):
+                return input_model_cls(**payload)
+            return input_model_cls.parse_obj(payload)
+        except ValidationError as exc:
+            raise ValueError(f"Runnable '{self.name}' input validation failed: {exc}") from exc
+
+    def _apply_output_model(self, result: Any) -> Any:
+        output_model_cls = getattr(self, "OutputModel", None)
+        if output_model_cls is None:
+            return result
+        try:
+            if isinstance(result, output_model_cls):
+                return result
+            if isinstance(result, dict):
+                return output_model_cls(**result)
+            return output_model_cls.parse_obj(result)
+        except ValidationError as exc:
+            raise ValueError(f"Runnable '{self.name}' output validation failed: {exc}") from exc
+
+    def _emit_node_status(self,
+                          context: Optional[ExecutionContext],
+                          status: str,
+                          metadata: Optional[Dict[str, Any]] = None) -> None:
+        if not context:
+            return
+        notifier = getattr(context, "notify_status", None)
+        if callable(notifier):
+            try:
+                notifier(self.name, status, metadata or {})
+            except Exception:  # pragma: no cover - never block execution due to observer failure
+                logger.debug("notify_status failed for node '%s'", self.name, exc_info=True)
+
     def invoke(self, input_data: Any = NO_INPUT, context: Optional[ExecutionContext] = None) -> Any:
         effective_context = context if context is not None else InMemoryExecutionContext(initial_input=input_data if input_data is not NO_INPUT else None)
         prepared_input_for_invoke = self._prepare_input_payload(input_data, effective_context)
 
         task_final_result: Any = NO_INPUT
         task_final_exception: Optional[Exception] = None
+
+        self._emit_node_status(effective_context, "start")
 
         if self._on_start_handler:
             try:
@@ -255,8 +347,9 @@ class Runnable(abc.ABC):
                     effective_context.log_event(f"Node '{self.name}': Invoking (Attempt {current_attempt}/{max_attempts}). Input type: {type(prepared_input_for_invoke).__name__}")
                     
                     try:
-                        result_internal = self._internal_invoke(prepared_input_for_invoke, effective_context)
-                        task_final_result = result_internal
+                        execution_input_payload = self._apply_input_model(prepared_input_for_invoke)
+                        result_internal = self._internal_invoke(execution_input_payload, effective_context)
+                        task_final_result = self._apply_output_model(result_internal)
                         task_final_exception = None 
                         
                         if self.use_cache and cache_key is not None: # <<< MODIFIED: Check use_cache before writing to cache
@@ -282,7 +375,7 @@ class Runnable(abc.ABC):
                                     elif callable(self._error_handler): 
                                         error_handler_output = self._error_handler(effective_context, prepared_input_for_invoke, e_internal)
                                     
-                                    task_final_result = error_handler_output
+                                    task_final_result = self._apply_output_model(error_handler_output)
                                     task_final_exception = None 
                                     
                                     if self.use_cache and cache_key is not None: # <<< MODIFIED: Check use_cache
@@ -316,8 +409,10 @@ class Runnable(abc.ABC):
                 effective_context.log_event(f"Node '{self.name}': Error in on_complete handler: {type(e_complete_hook).__name__}: {e_complete_hook}. This error is logged but does not alter task outcome.")
 
         if task_final_exception is not None:
+            self._emit_node_status(effective_context, "failed", {"exception": type(task_final_exception).__name__})
             raise task_final_exception
         
+        self._emit_node_status(effective_context, "success")
         return task_final_result
 
     @abc.abstractmethod
@@ -487,12 +582,17 @@ class SimpleTask(Runnable):
         self._expects_context = 'context' in self._func_signature.parameters
 
     def _internal_invoke(self, input_data: Any, context: ExecutionContext) -> Any:
-        if isinstance(input_data, dict):
-            payload = dict(input_data)
-        elif input_data is NO_INPUT:
+        if isinstance(input_data, BaseModel):
+            payload_source = input_data.dict()
+        else:
+            payload_source = input_data
+
+        if isinstance(payload_source, dict):
+            payload = dict(payload_source)
+        elif payload_source is NO_INPUT:
             payload = {}
         else:
-            payload = {"_input": input_data}
+            payload = {"_input": payload_source}
 
         call_kwargs = dict(payload)
         call_args: List[Any] = []

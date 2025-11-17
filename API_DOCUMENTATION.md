@@ -223,6 +223,7 @@ classDiagram
 - `node_outputs: Dict[str, Any]`: 已执行节点的输出集合。
 - `event_log: List[str]`: 执行过程中记录的事件（带时间戳，便于调试）。
 - `parent_context: Optional[ExecutionContext]`: 可选的父上下文，实现嵌套/子流程。
+- `node_status_events: List[Dict[str, Any]]`: 记录 `Runnable` 报告的 start/success/failed 事件；也可以重写/实现 `notify_status(node_name, status, metadata)` 将事件推送到外部系统。
 
 **主要方法：**
 
@@ -253,13 +254,14 @@ classDiagram
 - `_on_complete_handler: Optional[Union['Runnable', Callable[[ExecutionContext, Any, Optional[Exception]], None]]]`: 在 `invoke` 方法执行完毕（无论成功或失败，在所有重试和错误处理之后）时调用的处理器。可以是 `Runnable` 或可调用函数。
 - `_retry_config: Optional[Dict[str, Any]]`: 包含重试参数的字典，如 `max_attempts`, `delay_seconds`, `retry_on_exceptions`。
 - `_cache_key_generator: Callable`: 一个函数，用于根据输入数据和上下文生成缓存键。默认为 `_default_cache_key_generator`。**自定义 `cache_key_generator` 时，请务必考虑输入数据、上下文和 `input_declaration`，以确保缓存键的唯一性和有效性。**
+- `InputModel` / `OutputModel` / `ConfigModel`: 可选的 `pydantic.BaseModel` 子类，用于声明数据契约。声明后，taskpipe 会在执行前后自动做验证；`ConfigModel` 用于 `Runnable(..., config=...)` 的静态配置，并可通过 `get_config()` 或 `get_config_dict()` 导出。
 
 **主要方法:**
 
-- `__init__(self, name: Optional[str] = None, input_declaration: Any = None, cache_key_generator: Optional[Callable] = None)`: 构造函数。
+- `__init__(self, name: Optional[str] = None, input_declaration: Any = None, cache_key_generator: Optional[Callable] = None, use_cache: bool = False, config: Optional[Dict[str, Any]] = None)`: 构造函数；当声明 `ConfigModel` 时会自动校验 `config`。
 - `invoke(self, input_data: Any = NO_INPUT, context: Optional[ExecutionContext] = None) -> Any`:
     - **同步执行** `Runnable` 的核心公共方法。
-    - 管理执行流程：创建或使用 `ExecutionContext`，调用 `on_start` 钩子，解析输入数据，检查缓存，执行重试逻辑（内部包含 `_internal_invoke` 调用和 `on_error` 处理器逻辑），最后调用 `on_complete` 钩子。
+    - 管理执行流程：创建或使用 `ExecutionContext`，触发 `notify_status(..., "start")`，调用 `on_start` 钩子，解析输入数据（支持 `InputModel` 验证），检查缓存，执行重试逻辑（内部包含 `_internal_invoke` 调用和 `on_error` 处理器逻辑），最后调用 `on_complete` 钩子并触发 `success/failed` 状态。
 - `_internal_invoke(self, input_data: Any, context: ExecutionContext) -> Any`: (抽象方法) **同步**子类必须实现此方法以定义其核心同步逻辑。
 - `invoke_async(self, input_data: Any = NO_INPUT, context: Optional[ExecutionContext] = None) -> Coroutine[Any, Any, Any]`:
     - **异步执行** `Runnable` 的核心公共方法。
@@ -277,6 +279,10 @@ classDiagram
     - `Runnable` 基类中的默认异步检查逻辑是简单地对数据进行布尔转换并返回。
     - `AsyncRunnable` 子类应重写此方法以提供真正的异步检查逻辑。
 - `set_check(self, func: Union[Callable[[Any], bool], Callable[[Any], Coroutine[Any, Any, bool]]]) -> 'Runnable'`:
+- **Pydantic 数据契约**：
+    - 若声明 `InputModel`，`invoke`/`invoke_async` 会在 `_internal_invoke` 之前自动执行 `InputModel(**payload)` 并将模型实例传入；校验失败会抛出 `ValueError`。
+    - 若声明 `OutputModel`，`_internal_invoke` 返回后会执行 `OutputModel.parse_obj(result)`，返回的就是模型实例。
+    - `ConfigModel` 允许你定义静态配置 schema，实例化 `Runnable` 时传入 `config=` 字典即可自动校验，方便序列化/反序列化。
     - 允许用户自定义 `check` 方法的逻辑。
     - 如果 `func` 是一个协程函数，它将被设置为 `_custom_async_check_fn`。
     - 如果 `func` 是一个普通的可调用函数，它将被设置为 `_custom_check_fn`。
@@ -415,7 +421,7 @@ classDiagram
 * `set_output_nodes(self, node_names: List[str]) -> 'WorkflowGraph'`: 设置图的输出节点列表。
 * `compile(self) -> 'CompiledGraph'`: 分析图结构（进行拓扑排序以检测循环并确定执行顺序），并返回一个可执行的 `CompiledGraph` 实例。
 * `to_json(self) -> Dict[str, Any]`: 将当前图序列化，便于持久化或下发至低代码平台（暂不序列化复杂的 `input_mapper`）。
-* `@classmethod from_json(cls, json_data: Dict[str, Any], registry: Dict[str, Union[Runnable, Callable[[], Runnable]]]) -> WorkflowGraph`: 根据 JSON + 注册表重建工作流，其中 `registry` 负责把节点的 `"ref"` 映射为可实例化的 `Runnable`。
+* `@classmethod from_json(cls, json_data: Dict[str, Any], registry: Union[Dict[str, Union[Runnable, Callable[[], Runnable]]], RunnableRegistry]) -> WorkflowGraph`: 根据 JSON + 注册表重建工作流，可以传入 taskpipe 自带的 `RunnableRegistry`。
 
 同时，任何 `Runnable`/`AsyncRunnable` 都可以调用 `.to_graph(graph_name=None)`。该方法会递归地“展开”由 `|`、`%`、`>>` 等操作符构建的动态结构，生成一个等价的 `WorkflowGraph`，从而实现代码模式与声明式模式之间的互操作。请参考 `examples/example.py`：该示例将图保存为 `examples/numbers_workflow.json`，并展示如何通过 `WorkflowGraph.from_json(...)` + `registry` 反序列化回可执行的图。
 
@@ -429,6 +435,7 @@ classDiagram
 * `nodes: Dict[str, Runnable]`: 编译时图中所有节点的映射。
 * `edges: Dict[str, List[Tuple[str, Optional[Callable]]]]`: 编译时边的映射。
 * `sorted_nodes: List[str]`: 按拓扑顺序排序的节点名称列表，用于确定执行顺序。
+* `execution_stages: List[List[str]]`: 由拓扑排序推导出的阶段划分，同一阶段内的节点互不依赖，可在异步执行时并发运行。
 * `entry_points: List[str]`: 图的实际入口点。
 * `output_nodes: List[str]`: 图的实际输出节点。
 * `graph_def_name: str`: 从中编译此图的 `WorkflowGraph` 的名称。
@@ -438,7 +445,7 @@ classDiagram
 * `_internal_invoke(self, input_data: Any, context: ExecutionContext) -> Any`:
   * **同步执行**整个图。
   * 创建一个内部的 `ExecutionContext` (其父级是传入的 `context`)。
-  * 按 `sorted_nodes` 的顺序遍历节点。
+  * 按 `execution_stages` 的顺序遍历节点（同步模式下仍是顺序执行）。
   * 对每个节点：
     * 调用 `_prepare_node_input` 来确定该节点的输入（基于图的初始输入、父节点输出、`input_mapper` 或节点的 `input_declaration`）。
     * 调用节点的同步 `node.invoke(node_input, internal_graph_context)`。
@@ -447,10 +454,10 @@ classDiagram
 * `_internal_invoke_async(self, input_data: Any, context: ExecutionContext) -> Coroutine[Any, Any, Any]`:
   * **异步执行**整个图的核心逻辑。
   * 创建一个内部的 `ExecutionContext`。
-  * 按 `sorted_nodes` 的顺序遍历节点。
-  * 对每个节点：
-    * 调用 `_prepare_node_input` (同步方法) 来确定输入。
-    * `await node.invoke_async(node_input, internal_graph_context)`。
+  * 按 `execution_stages` 的顺序遍历节点。
+  * 对每个阶段：
+    * 准备每个节点的输入。
+    * 使用 `asyncio.gather` 并发执行所有节点的 `invoke_async`。
       * 如果节点是同步 `Runnable`，其 `invoke_async` 会在线程池中运行其同步 `invoke`。
       * 如果节点是 `AsyncRunnable`，其原生的 `invoke_async` 会被执行。
   * 收集 `output_nodes` 的结果并返回。
@@ -477,6 +484,16 @@ classDiagram
    * **强烈不推荐**在异步上下文中对 `AsyncRunnable` 或包含异步组件的组合器使用同步的 `.invoke()` 方法，因为这会导致 `asyncio.run()` 在已运行的循环中被调用，从而引发 `RuntimeError`。
 
 **简而言之**：在 `async def` 中，总是用 `await ...invoke_async()`。在普通 `def` 中，用 `.invoke()`。
+
+## `taskpipe.registry.RunnableRegistry`
+
+`RunnableRegistry` 是一个可选的辅助类，适合在应用层集中管理可用的 `Runnable`：
+
+- `register(name, factory_or_cls)`: 注册 `Runnable` 子类、实例或返回 `Runnable` 的工厂。
+- `register_class(cls, name=None)`: 语法糖/装饰器。
+- `get(name) -> Runnable`: 返回一个新的实例，可直接传给 `WorkflowGraph.add_node` / `.from_json(...)`。
+
+`WorkflowGraph.from_json` 可直接接收 `RunnableRegistry`，避免在多个地方维护手写 `dict`。
 
 ## TaskPipe 的适用场景与边界
 

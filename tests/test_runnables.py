@@ -5,6 +5,20 @@ import asyncio # Added for testing invoke_async
 from unittest.mock import MagicMock, call, patch
 from typing import Any, Callable, Optional, Dict, List, Tuple, Union, Type, Coroutine # Added Coroutine
 
+from pydantic import BaseModel
+
+
+class _SchemaInput(BaseModel):
+    value: int
+
+
+class _SchemaOutput(BaseModel):
+    doubled: int
+
+
+class _SchemaConfig(BaseModel):
+    multiplier: int = 2
+
 from taskpipe import ( 
     ExecutionContext,
     InMemoryExecutionContext,
@@ -91,6 +105,31 @@ class MockAsyncRunnableForSyncTest(AsyncRunnable):
 
 
 class TestRunnableBase(unittest.TestCase):
+    def test_runnable_with_pydantic_models(self):
+        class SchemaRunnable(Runnable):
+            InputModel = _SchemaInput
+            OutputModel = _SchemaOutput
+            ConfigModel = _SchemaConfig
+
+            def _internal_invoke(self, input_data, context):
+                return {"doubled": input_data.value * self.config.multiplier}
+
+        runnable = SchemaRunnable(config={"multiplier": 3})
+        ctx = InMemoryExecutionContext()
+        result = runnable.invoke({"value": 4}, ctx)
+        self.assertIsInstance(result, _SchemaOutput)
+        self.assertEqual(result.doubled, 12)
+
+        with self.assertRaises(ValueError):
+            runnable.invoke({"value": "oops"}, ctx)
+
+    def test_runnable_status_notifications(self):
+        ctx = InMemoryExecutionContext()
+        task = SimpleTask(lambda: "ok", name="StatusTask")
+        task.invoke(NO_INPUT, ctx)
+        statuses = [event["status"] for event in ctx.node_status_events]
+        self.assertEqual(statuses, ["start", "success"])
+
     # ... (existing test_naming, test_invoke_caching_with_context_sensitivity, etc. remain) ...
     # Add new tests for invoke_async and check_async on base Runnable
     def test_naming(self):

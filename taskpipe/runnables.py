@@ -5,16 +5,28 @@ import hashlib
 import pickle
 import asyncio # Added for invoke_async
 import inspect
-from typing import Any, Callable, Optional, Dict, List, Tuple, Union, Type, Coroutine
-from typing import Any, Callable, Optional, Dict, List, Tuple, Union, Type, Coroutine
-from typing import TypeVar, cast
+from dataclasses import dataclass, field
+from typing import (
+    Any,
+    Callable,
+    Dict,
+    List,
+    Optional,
+    Tuple,
+    Type,
+    TypeVar,
+    Union,
+    Coroutine,
+    cast,
+    get_type_hints,
+)
 
 try:
     from typing import Protocol, runtime_checkable
 except ImportError:
     from typing_extensions import Protocol, runtime_checkable
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from pydantic import BaseModel, ValidationError
+from pydantic import BaseModel, ValidationError, create_model
 
 # 用于标记没有显式输入的情况
 NO_INPUT = object()
@@ -80,37 +92,18 @@ class InMemoryExecutionContext:
     def __repr__(self) -> str:
         return f"<InMemoryExecutionContext id={id(self)} initial_input={str(self.initial_input)[:60]}, node_outputs_keys={list(self.node_outputs.keys())}>"
 
-def _default_cache_key_generator(runnable_name: str, input_data: Any, context: Optional[ExecutionContext], input_declaration: Any) -> Any:
+def _default_cache_key_generator(runnable_name: str, input_data: Any, context: Optional[ExecutionContext], bindings_signature: Any) -> Any:
     """
     默认的缓存键生成器。
-    尝试序列化输入数据和从上下文中根据 input_declaration 获取的相关数据。
+    尝试序列化输入数据和输入绑定（map_inputs/static_inputs）相关信息。
     """
     try:
         input_data_bytes = pickle.dumps(input_data)
-        declared_inputs_tuple = None
-        if context and input_declaration:
-            relevant_context_outputs = {}
-            if isinstance(input_declaration, str):
-                relevant_context_outputs[input_declaration] = context.get_output(input_declaration)
-            elif isinstance(input_declaration, dict):
-                for key, source_name in input_declaration.items():
-                    if isinstance(source_name, str):
-                        relevant_context_outputs[key] = context.get_output(source_name)
-            elif callable(input_declaration):
-                 relevant_context_outputs["_declaration_callable"] = input_declaration
-            
-            hashable_context_items = []
-            for k, v in sorted(relevant_context_outputs.items()):
-                 try:
-                      hashable_context_items.append((k, pickle.dumps(v)))
-                 except Exception:
-                      hashable_context_items.append((k, str(v) + type(v).__name__))
-            declared_inputs_tuple = tuple(hashable_context_items)
-        declared_inputs_bytes = pickle.dumps(declared_inputs_tuple)
+        bindings_bytes = pickle.dumps(bindings_signature)
 
         hasher = hashlib.md5()
         hasher.update(input_data_bytes)
-        hasher.update(declared_inputs_bytes)
+        hasher.update(bindings_bytes)
         hasher.update(runnable_name.encode('utf-8'))
         return hasher.hexdigest()
     except Exception as e:
@@ -120,6 +113,34 @@ def _default_cache_key_generator(runnable_name: str, input_data: Any, context: O
 ConfigModelType = TypeVar("ConfigModelType", bound=BaseModel)
 InputModelType = TypeVar("InputModelType", bound=BaseModel)
 OutputModelType = TypeVar("OutputModelType", bound=BaseModel)
+
+
+@dataclass(frozen=True)
+class _OutputFieldRef:
+    source: 'Runnable'
+    field_name: str
+
+
+@dataclass
+class _InputBinding:
+    target_field: str
+    source: Optional['Runnable'] = None
+    source_field: Optional[str] = None
+    static_value: Any = None
+
+    def is_dynamic(self) -> bool:
+        return self.source is not None and self.source_field is not None
+
+    def is_static(self) -> bool:
+        return self.source is None
+
+
+class _OutputAccessor:
+    def __init__(self, runnable: 'Runnable'):
+        self._runnable = runnable
+
+    def __getattr__(self, item: str) -> _OutputFieldRef:
+        return _OutputFieldRef(source=self._runnable, field_name=item)
 
 
 class Runnable(abc.ABC):
@@ -132,7 +153,6 @@ class Runnable(abc.ABC):
 
     def __init__(self,
                  name: Optional[str] = None,
-                 input_declaration: Any = None,
                  cache_key_generator: Optional[Callable[[str, Any, Optional[ExecutionContext], Any], Any]] = None,
                  use_cache: bool = False,
                  config: Optional[Union[BaseModel, Dict[str, Any]]] = None): # <<< NEW PARAMETER, defaulting to False
@@ -149,12 +169,51 @@ class Runnable(abc.ABC):
 
         self._error_handler: Optional[Union['Runnable', Callable[[ExecutionContext, Any, Exception], Any]]] = None
         self._retry_config: Optional[Dict[str, Any]] = None
-        self.input_declaration: Any = input_declaration
         self._cache_key_generator = cache_key_generator or _default_cache_key_generator
 
         self._on_start_handler: Optional[Union['Runnable', Callable[[ExecutionContext, Any], None]]] = None
         self._on_complete_handler: Optional[Union['Runnable', Callable[[ExecutionContext, Any, Optional[Exception]], None]]] = None
         self.config = self._initialize_config(config)
+        self._input_bindings: Dict[str, _InputBinding] = {}
+        self._input_model_cls: Type[BaseModel] = self._resolve_model_cls("InputModel")
+        self._output_model_cls: Type[BaseModel] = self._resolve_model_cls("OutputModel")
+
+    def _resolve_model_cls(self, attr_name: str) -> Type[BaseModel]:
+        model_cls = getattr(self, attr_name, None)
+        if model_cls is None:
+            raise TypeError(f"{self.__class__.__name__} 必须定义 {attr_name}.")
+        if not inspect.isclass(model_cls) or not issubclass(model_cls, BaseModel):
+            raise TypeError(f"{self.__class__.__name__}.{attr_name} 必须继承 BaseModel.")
+        return model_cls
+
+    @property
+    def Output(self) -> _OutputAccessor:
+        return _OutputAccessor(self)
+
+    def map_inputs(self, **mappings: Any) -> 'Runnable':
+        clone = self.copy()
+        updated = dict(clone._input_bindings)
+        for target_field, value in mappings.items():
+            if target_field not in clone._input_model_cls.__fields__:
+                raise ValueError(f"{clone.name}: InputModel 不包含字段 '{target_field}'")
+            if isinstance(value, _OutputFieldRef):
+                source_fields = value.source._output_model_cls.__fields__
+                if value.field_name not in source_fields:
+                    raise ValueError(
+                        f"{clone.name}: {value.source.name}.OutputModel 缺少字段 '{value.field_name}'."
+                    )
+                updated[target_field] = _InputBinding(
+                    target_field=target_field,
+                    source=value.source,
+                    source_field=value.field_name,
+                )
+            else:
+                updated[target_field] = _InputBinding(
+                    target_field=target_field,
+                    static_value=value,
+                )
+        clone._input_bindings = updated
+        return clone
     def _initialize_config(self, config_data: Optional[Union[BaseModel, Dict[str, Any]]]) -> Any:
         config_cls = getattr(self, "ConfigModel", None)
         if config_cls is None:
@@ -181,47 +240,91 @@ class Runnable(abc.ABC):
         return None
 
 
-    def _context_inputs_from_declaration(self, context: Optional[ExecutionContext]) -> Dict[str, Any]:
-        if not self.input_declaration or context is None:
+    def describe_input_schema(self) -> Dict[str, str]:
+        return {
+            field_name: self._type_name(field.outer_type_)
+            for field_name, field in self._input_model_cls.__fields__.items()
+        }
+
+    def describe_output_schema(self) -> Dict[str, str]:
+        return {
+            field_name: self._type_name(field.outer_type_)
+            for field_name, field in self._output_model_cls.__fields__.items()
+        }
+
+    @staticmethod
+    def _type_name(tp: Any) -> str:
+        try:
+            return tp.__name__
+        except AttributeError:
+            return str(tp)
+
+    def _normalize_direct_input(self, direct_input: Any) -> Dict[str, Any]:
+        if direct_input is NO_INPUT or direct_input is None:
             return {}
+        if isinstance(direct_input, BaseModel):
+            return direct_input.dict()
+        if isinstance(direct_input, dict):
+            return dict(direct_input)
+        model_fields = list(self._input_model_cls.__fields__.keys())
+        if len(model_fields) == 1:
+            return {model_fields[0]: direct_input}
+        raise ValueError(
+            f"{self.name}: 无法将标量输入映射到多字段 InputModel。请使用 map_inputs 或传入字典。"
+        )
 
-        if isinstance(self.input_declaration, str):
-            return {"_input": context.get_output(self.input_declaration)}
+    def _resolve_inputs_from_bindings(
+        self,
+        context: Optional[ExecutionContext],
+    ) -> Dict[str, Any]:
+        resolved: Dict[str, Any] = {}
+        for target_field, binding in self._input_bindings.items():
+            if binding.is_dynamic():
+                if not context or not binding.source:
+                    raise RuntimeError(
+                        f"{self.name}: 缺少 ExecutionContext，无法解析映射输入 '{target_field}'."
+                    )
+                parent_output = context.get_output(binding.source.name)
+                parent_dict = self._model_to_plain(parent_output)
+                if binding.source_field not in parent_dict:
+                    raise KeyError(
+                        f"{self.name}: 上游 {binding.source.name} 输出中不存在字段 '{binding.source_field}'."
+                    )
+                resolved[target_field] = parent_dict[binding.source_field]
+            elif binding.is_static():
+                resolved[target_field] = binding.static_value
+        return resolved
 
-        if isinstance(self.input_declaration, dict):
-            resolved: Dict[str, Any] = {}
-            for param_name, source_key in self.input_declaration.items():
-                if isinstance(source_key, str):
-                    resolved[param_name] = context.get_output(source_key)
-                else:
-                    resolved[param_name] = source_key
-            return resolved
+    def _dynamic_mapping_for_source(self, source: 'Runnable') -> Dict[str, str]:
+        mapping: Dict[str, str] = {}
+        for target_field, binding in self._input_bindings.items():
+            if binding.is_dynamic() and binding.source is source:
+                mapping[target_field] = binding.source_field
+        return mapping
 
-        if callable(self.input_declaration):
-            value = self.input_declaration(context)
-            return self._normalize_callable_input_value(value)
+    def _static_binding_values(self) -> Dict[str, Any]:
+        static_values: Dict[str, Any] = {}
+        for target_field, binding in self._input_bindings.items():
+            if binding.is_static():
+                static_values[target_field] = binding.static_value
+        return static_values
 
-        raise TypeError("input_declaration must be a str, dict, or callable.")
-
-    def _normalize_callable_input_value(self, value: Any) -> Dict[str, Any]:
-        if value is None or value is NO_INPUT:
+    @staticmethod
+    def _model_to_plain(payload: Any) -> Dict[str, Any]:
+        if payload is None or payload is NO_INPUT:
             return {}
-        if isinstance(value, dict):
-            return dict(value)
-        return {"_input": value}
+        if isinstance(payload, BaseModel):
+            return payload.dict()
+        if isinstance(payload, dict):
+            return dict(payload)
+        return {"value": payload}
 
-    def _merge_input_payloads(self, context_inputs: Optional[Dict[str, Any]], direct_input: Any) -> Dict[str, Any]:
-        merged_input: Dict[str, Any] = dict(context_inputs or {})
-        if direct_input is not NO_INPUT:
-            if isinstance(direct_input, dict):
-                merged_input.update(direct_input)
-            else:
-                merged_input["_input"] = direct_input
-        return merged_input
-
-    def _prepare_input_payload(self, direct_input: Any, effective_context: Optional[ExecutionContext]) -> Dict[str, Any]:
-        context_inputs = self._context_inputs_from_declaration(effective_context)
-        return self._merge_input_payloads(context_inputs, direct_input)
+    def _prepare_input_payload(self, direct_input: Any, effective_context: Optional[ExecutionContext]) -> Any:
+        payload = self._resolve_inputs_from_bindings(effective_context)
+        payload.update(self._normalize_direct_input(direct_input))
+        if not payload:
+            return NO_INPUT
+        return payload
 
     @staticmethod
     def _unwrap_input_payload(payload: Any) -> Any:
@@ -233,7 +336,20 @@ class Runnable(abc.ABC):
         return payload
 
     def _get_cache_key(self, input_data: Any, context: Optional[ExecutionContext]) -> Any:
-        return self._cache_key_generator(self.name, input_data, context, self.input_declaration)
+        binding_signature = tuple(
+            sorted(
+                (
+                    target,
+                    (
+                        binding.source.name if binding.source else None,
+                        binding.source_field,
+                        binding.static_value,
+                    ),
+                )
+                for target, binding in self._input_bindings.items()
+            )
+        )
+        return self._cache_key_generator(self.name, input_data, context, binding_signature)
 
     def set_on_start(self, handler: Union['Runnable', Callable[[ExecutionContext, Any], None]]) -> 'Runnable':
         if not isinstance(handler, Runnable) and not callable(handler):
@@ -562,65 +678,131 @@ class _PendingConditional:
         return Conditional(self.condition_r, self.true_r, false_r, name=name)
 
 
-class SimpleTask(Runnable):
-    def __init__(self, func: Callable, name: Optional[str] = None, input_declaration: Any = None, **kwargs):
-        default_name = getattr(func, '__name__', None)
-        if default_name == '<lambda>': 
-             default_name = None 
+def _build_input_model_from_callable(func: Callable, task_name: str) -> Type[BaseModel]:
+    signature = inspect.signature(func)
+    hints = get_type_hints(func)
+    field_defs: Dict[str, Tuple[Any, Any]] = {}
+    for param in signature.parameters.values():
+        if param.kind in (inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD):
+            if param.name != "context":
+                raise TypeError(
+                    f"@task 函数 '{func.__name__}' 不能使用 *args/**kwargs（除非参数名为 context）。"
+                )
+            continue
+        if param.name == "context":
+            continue
+        annotation = hints.get(param.name, Any)
+        default = param.default if param.default is not inspect._empty else ...
+        field_defs[param.name] = (annotation, default)
 
-        super().__init__(name or default_name, input_declaration=input_declaration, **kwargs)
-        
+    model_name = f"{task_name}Input"
+    if not field_defs:
+        return create_model(model_name)
+    return create_model(model_name, **field_defs)
+
+
+def _build_output_model_from_callable(func: Callable, task_name: str) -> Type[BaseModel]:
+    hints = get_type_hints(func)
+    return_hint = hints.get("return", Any)
+
+    if inspect.isclass(return_hint) and issubclass(return_hint, BaseModel):
+        return return_hint
+
+    annotations = getattr(return_hint, "__annotations__", None)
+    if isinstance(annotations, dict) and annotations:
+        fields = {
+            field_name: (field_type, ...)
+            for field_name, field_type in annotations.items()
+        }
+        return create_model(f"{task_name}Output", **fields)
+
+    return create_model(f"{task_name}Output", result=(return_hint, ...))
+
+
+def task(func: Optional[Callable] = None, *, name: Optional[str] = None):
+    """
+    将普通函数转换为带强类型契约的 Runnable 子类。
+    """
+
+    def decorator(callable_obj: Callable) -> Type[Runnable]:
+        if not callable(callable_obj):
+            raise TypeError("@task 只能装饰可调用对象。")
+
+        task_name = name or getattr(callable_obj, "__name__", "Task")
+        input_model = _build_input_model_from_callable(callable_obj, task_name)
+        output_model = _build_output_model_from_callable(callable_obj, task_name)
+        signature = inspect.signature(callable_obj)
+        expects_context = "context" in signature.parameters
+
+        class GeneratedTask(Runnable):
+            InputModel = input_model
+            OutputModel = output_model
+
+            def __init__(self, **kwargs):
+                runtime_name = kwargs.pop("name", task_name)
+                super().__init__(name=runtime_name, **kwargs)
+
+            def _internal_invoke(self, input_data: Any, context: ExecutionContext) -> Any:
+                payload = input_data.dict() if isinstance(input_data, BaseModel) else dict(input_data or {})
+                if expects_context:
+                    payload["context"] = context
+                result = callable_obj(**payload)
+                if isinstance(result, BaseModel):
+                    return result
+                if isinstance(result, dict):
+                    return result
+                output_fields = list(self.OutputModel.__fields__.keys())
+                if len(output_fields) == 1:
+                    return {output_fields[0]: result}
+                return result
+
+        GeneratedTask.__name__ = task_name
+        GeneratedTask.__doc__ = getattr(callable_obj, "__doc__", None)
+        GeneratedTask.__module__ = callable_obj.__module__
+        return GeneratedTask
+
+    if func is not None:
+        return decorator(func)
+    return decorator
+
+
+class SimpleTask(Runnable):
+    def __init__(self, func: Callable, name: Optional[str] = None, **kwargs):
         if not callable(func):
-            raise TypeError("func must be a callable")
-        self.func = func
-        self._func_signature = inspect.signature(func)
-        self._func_param_names = tuple(self._func_signature.parameters.keys())
-        self._accepts_var_kwargs = any(
-            param.kind == inspect.Parameter.VAR_KEYWORD
-            for param in self._func_signature.parameters.values()
-        )
-        self._expects_context = 'context' in self._func_signature.parameters
+            raise TypeError("SimpleTask requires a callable.")
+        self._callable = func
+        self._signature = inspect.signature(func)
+        self._expects_context = "context" in self._signature.parameters
+        task_name = name or getattr(func, "__name__", None) or "SimpleTask"
+        self.InputModel = _build_input_model_from_callable(func, task_name)
+        self.OutputModel = _build_output_model_from_callable(func, task_name)
+        super().__init__(task_name, **kwargs)
 
     def _internal_invoke(self, input_data: Any, context: ExecutionContext) -> Any:
-        if isinstance(input_data, BaseModel):
-            payload_source = input_data.dict()
-        else:
-            payload_source = input_data
-
-        if isinstance(payload_source, dict):
-            payload = dict(payload_source)
-        elif payload_source is NO_INPUT:
-            payload = {}
-        else:
-            payload = {"_input": payload_source}
-
-        call_kwargs = dict(payload)
-        call_args: List[Any] = []
-
-        direct_value = call_kwargs.pop('_input', NO_INPUT)
-        if direct_value is not NO_INPUT:
-            if '_input' in self._func_param_names or self._accepts_var_kwargs:
-                call_kwargs['_input'] = direct_value
-            else:
-                call_args.append(direct_value)
-
-        if self._expects_context and 'context' not in call_kwargs:
-            call_kwargs['context'] = context
-
-        return self.func(*call_args, **call_kwargs)
+        payload = input_data.dict() if isinstance(input_data, BaseModel) else dict(input_data or {})
+        if self._expects_context:
+            payload.setdefault("context", context)
+        result = self._callable(**payload)
+        if isinstance(result, BaseModel):
+            return result
+        if isinstance(result, dict):
+            return result
+        output_fields = list(self.OutputModel.__fields__.keys())
+        if len(output_fields) == 1:
+            return {output_fields[0]: result}
+        return result
 
 
 class Pipeline(Runnable):
     def __init__(self, first: Runnable, second: Runnable, name: Optional[str] = None, **kwargs):
         effective_name = name or f"Pipeline[{first.name}_then_{second.name}]"
-        super().__init__(name=effective_name, **kwargs) 
-        
         if not isinstance(first, Runnable) or not isinstance(second, Runnable):
             raise TypeError("Both 'first' and 'second' must be Runnable instances.")
         self.first = first
         self.second = second
-        if self.input_declaration is None and first.input_declaration is not None:
-            self.input_declaration = first.input_declaration
+        self.InputModel = first._input_model_cls
+        self.OutputModel = second._output_model_cls
+        super().__init__(name=effective_name, **kwargs)
 
 
     def _internal_invoke(self, input_data: Any, context: ExecutionContext) -> Any:
@@ -642,10 +824,14 @@ class Pipeline(Runnable):
 
 class Conditional(Runnable):
     def __init__(self, condition_r: Runnable, true_r: Runnable, false_r: Runnable, name: Optional[str] = None, **kwargs):
-        super().__init__(name or f"Cond[{condition_r.name}?{true_r.name}:{false_r.name}]", **kwargs)
         self.condition_r = condition_r
         self.true_r = true_r
         self.false_r = false_r
+        if set(true_r._output_model_cls.__fields__.keys()) != set(false_r._output_model_cls.__fields__.keys()):
+            raise ValueError("Conditional 的 true/false 分支必须拥有兼容的 OutputModel。")
+        self.InputModel = condition_r._input_model_cls
+        self.OutputModel = true_r._output_model_cls
+        super().__init__(name or f"Cond[{condition_r.name}?{true_r.name}:{false_r.name}]", **kwargs)
 
     def _internal_invoke(self, input_data: Any, context: ExecutionContext) -> Any:
         condition_output = self.condition_r.invoke(input_data, context)
@@ -666,11 +852,27 @@ class Conditional(Runnable):
 
 class BranchAndFanIn(Runnable):
     def __init__(self, tasks_dict: Dict[str, Runnable], name: Optional[str] = None, max_workers: Optional[int] = None, **kwargs):
-        super().__init__(name or f"BranchFanIn_{'_'.join(tasks_dict.keys())}", **kwargs)
         if not isinstance(tasks_dict, dict) or not all(isinstance(r, Runnable) for r in tasks_dict.values()):
             raise TypeError("tasks_dict must be a dictionary of Runnables.")
         self.tasks_dict = tasks_dict
         self.max_workers = max_workers
+        branch_names = "_".join(tasks_dict.keys())
+        self.InputModel = self._ensure_uniform_input_model()
+        self.OutputModel = self._build_output_model(name or f"BranchFanIn_{branch_names}")
+        super().__init__(name or f"BranchFanIn_{branch_names}", **kwargs)
+
+    def _ensure_uniform_input_model(self) -> Type[BaseModel]:
+        models = {task._input_model_cls for task in self.tasks_dict.values()}
+        if len(models) != 1:
+            raise ValueError("BranchAndFanIn 所有子任务必须共享相同的 InputModel。")
+        return next(iter(models))
+
+    def _build_output_model(self, base_name: str) -> Type[BaseModel]:
+        fields = {
+            key: (task._output_model_cls, ...)
+            for key, task in self.tasks_dict.items()
+        }
+        return create_model(f"{base_name}Output", **fields)
 
     def _internal_invoke(self, input_data: Any, context: ExecutionContext) -> Dict[str, Any]:
         results: Dict[str, Any] = {}
@@ -680,7 +882,7 @@ class BranchAndFanIn(Runnable):
             future_to_key = {
                 executor.submit(
                     task.invoke,
-                    input_data if not task.input_declaration else NO_INPUT,
+                    input_data,
                     context
                 ): key
                 for key, task in self.tasks_dict.items()
@@ -710,31 +912,43 @@ class BranchAndFanIn(Runnable):
 
 class SourceParallel(Runnable):
     def __init__(self, tasks_dict: Dict[str, Runnable], name: Optional[str] = None, max_workers: Optional[int] = None, **kwargs):
-        super().__init__(name or f"SourceParallel_{'_'.join(tasks_dict.keys())}", **kwargs)
         if not isinstance(tasks_dict, dict) or not all(isinstance(r, Runnable) for r in tasks_dict.values()):
             raise TypeError("tasks_dict must be a dictionary of Runnables.")
         self.tasks_dict = tasks_dict
         self.max_workers = max_workers
+        branch_names = "_".join(tasks_dict.keys())
+        self.InputModel = self._ensure_uniform_input_model()
+        self.OutputModel = self._build_output_model(name or f"SourceParallel_{branch_names}")
+        super().__init__(name or f"SourceParallel_{branch_names}", **kwargs)
+
+    def _ensure_uniform_input_model(self) -> Type[BaseModel]:
+        models = {task._input_model_cls for task in self.tasks_dict.values()}
+        if len(models) != 1:
+            raise ValueError("SourceParallel 所有子任务必须共享相同的 InputModel。")
+        return next(iter(models))
+
+    def _build_output_model(self, base_name: str) -> Type[BaseModel]:
+        fields = {
+            key: (task._output_model_cls, ...)
+            for key, task in self.tasks_dict.items()
+        }
+        return create_model(f"{base_name}Output", **fields)
 
     def _internal_invoke(self, input_data: Any, context: ExecutionContext) -> Dict[str, Any]:
-        unwrapped_input = self._unwrap_input_payload(input_data)
-        actual_input = context.initial_input if unwrapped_input is NO_INPUT else unwrapped_input
-        context.log_event(f"Node '{self.name}': Starting parallel execution for {len(self.tasks_dict)} tasks. Input type: {type(actual_input).__name__}")
+        context.log_event(
+            f"Node '{self.name}': Starting parallel execution for {len(self.tasks_dict)} tasks. "
+            f"Input type: {type(input_data).__name__}"
+        )
 
         aggregated_results: Dict[str, Any] = {}
-        # Keep track of futures to handle exceptions properly
         future_to_branch_key: Dict[Any, str] = {}
         exceptions = {}
 
         with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
             for key, task_runnable in self.tasks_dict.items():
-                # Each branch in SourceParallel should typically get its own sub-context
-                # if isolation is desired, or use the passed context directly.
-                # For simplicity here, using the main context for each branch.
-                # A more advanced version might create sub-contexts.
-                future = executor.submit(task_runnable.invoke, actual_input, context)
+                future = executor.submit(task_runnable.invoke, input_data, context)
                 future_to_branch_key[future] = key
-            
+
             for future in as_completed(future_to_branch_key):
                 key = future_to_branch_key[future]
                 task_name = self.tasks_dict[key].name
@@ -745,15 +959,14 @@ class SourceParallel(Runnable):
                 except Exception as e:
                     context.log_event(f"Node '{self.name}', Branch '{key}' ({task_name}): FAILED with {type(e).__name__}: {str(e)[:100]}.")
                     exceptions[key] = e
-        
+
         if exceptions:
             first_failed_key = sorted(exceptions.keys())[0]
             raise exceptions[first_failed_key]
-        
+
         for key_of_branch, branch_output_value in aggregated_results.items():
             context_key_for_branch_output = f"{self.name}_{key_of_branch}"
             context.add_output(context_key_for_branch_output, branch_output_value)
-            # context.log_event(f"Node '{self.name}': Added output for branch '{key_of_branch}' as '{context_key_for_branch_output}' to main context.")
 
         context.log_event(f"Node '{self.name}': All branches completed. Aggregated results: {list(aggregated_results.keys())}.")
         return aggregated_results
@@ -761,10 +974,14 @@ class SourceParallel(Runnable):
 
 class While(Runnable):
     def __init__(self, condition_check_runnable: Runnable, body_runnable: Runnable, max_loops: int = 100, name: Optional[str] = None, **kwargs):
-        super().__init__(name or f"While[{condition_check_runnable.name}_do_{body_runnable.name}]", **kwargs)
         self.condition_check_runnable = condition_check_runnable
         self.body_runnable = body_runnable
         self.max_loops = max_loops
+        loop_name = name or f"While[{condition_check_runnable.name}_do_{body_runnable.name}]"
+        body_output_cls = body_runnable._output_model_cls
+        self.InputModel = condition_check_runnable._input_model_cls
+        self.OutputModel = create_model(f"{loop_name}Output", history=(List[body_output_cls], ...))
+        super().__init__(loop_name, **kwargs)
 
     def _internal_invoke(self, input_data: Any, context: ExecutionContext) -> List[Any]:
         loop_count = 0
@@ -801,27 +1018,72 @@ class While(Runnable):
             context.log_event(f"Node '{self.name}': Loop exited due to max_loops ({self.max_loops}) reached.")
 
         context.log_event(f"Node '{self.name}': Loop finished. Returning {len(all_body_outputs)} outputs.")
-        return all_body_outputs
+        return {"history": all_body_outputs}
 
 
 class MergeInputs(Runnable):
-    def __init__(self, input_sources: Dict[str, str], merge_function: Callable[..., Any], name: Optional[str] = None, **kwargs):
-        super().__init__(name or f"MergeInputs_{getattr(merge_function, '__name__', 'custom')}", **kwargs)
-        self.input_sources = input_sources
+    """
+    兼容旧 API 的胶水节点。input_sources 参数仅用于向后兼容，
+    实际数据映射应通过 map_inputs 配置。
+    """
+
+    def __init__(self, input_sources: Optional[Dict[str, Any]], merge_function: Callable[..., Any], name: Optional[str] = None, **kwargs):
+        task_name = name or f"MergeInputs_{getattr(merge_function, '__name__', 'custom')}"
         self.merge_function = merge_function
-        self.input_declaration = self.input_sources 
+        self._legacy_input_sources = input_sources or {}
+        self.InputModel = _build_input_model_from_callable(merge_function, task_name)
+        self.OutputModel = _build_output_model_from_callable(merge_function, task_name)
+        super().__init__(task_name, **kwargs)
 
     def _internal_invoke(self, input_data: Any, context: ExecutionContext) -> Any:
-        kwargs_for_func = {}
-        context.log_event(f"Node '{self.name}': Fetching inputs from context: {list(self.input_sources.values())}")
-
-        for param_name, source_node_name in self.input_sources.items():
-            value = context.get_output(source_node_name)
-            kwargs_for_func[param_name] = value
-        
+        payload = input_data.dict() if isinstance(input_data, BaseModel) else dict(input_data or {})
         context.log_event(f"Node '{self.name}': Calling merge_function '{getattr(self.merge_function, '__name__', 'custom')}'.")
-        return self.merge_function(**kwargs_for_func)
+        return self.merge_function(**payload)
 
+
+class Router(Runnable):
+    class InputModel(BaseModel):
+        condition: bool
+
+    class OutputModel(BaseModel):
+        decision: bool
+
+    def __init__(self, name: Optional[str] = None, **kwargs):
+        super().__init__(name or "Router", **kwargs)
+
+    def _internal_invoke(self, input_data: Any, context: ExecutionContext) -> Any:
+        decision = bool(input_data.condition if isinstance(input_data, BaseModel) else input_data.get("condition"))
+        context.log_event(f"Node '{self.name}': Routing based on condition={decision}.")
+        return {"decision": decision}
+
+
+class ScriptRunnable(Runnable):
+    class ConfigModel(BaseModel):
+        code: str
+        input_keys: List[str]
+        output_keys: List[str]
+
+    def __init__(self, name: Optional[str] = None, config: Optional[Dict[str, Any]] = None, **kwargs):
+        config_obj = config if isinstance(config, ScriptRunnable.ConfigModel) else ScriptRunnable.ConfigModel(**(config or {}))
+        task_name = name or "ScriptRunnable"
+        self.InputModel = create_model(
+            f"{task_name}Input",
+            **{key: (Any, ...) for key in config_obj.input_keys}
+        ) if config_obj.input_keys else create_model(f"{task_name}Input")
+        self.OutputModel = create_model(
+            f"{task_name}Output",
+            **{key: (Any, ...) for key in config_obj.output_keys}
+        ) if config_obj.output_keys else create_model(f"{task_name}Output", result=(Any, ...))
+        super().__init__(name=task_name, config=config_obj, **kwargs)
+
+    def _internal_invoke(self, input_data: Any, context: ExecutionContext) -> Any:
+        payload = input_data.dict() if isinstance(input_data, BaseModel) else dict(input_data or {})
+        local_vars = {key: payload.get(key) for key in self.config.input_keys}
+        local_vars["context"] = context
+        exec(self.config.code, {}, local_vars)
+        if self.config.output_keys:
+            return {key: local_vars.get(key) for key in self.config.output_keys}
+        return {"result": local_vars.get("result")}
 
 class _GraphExportHelper:
     def __init__(self):

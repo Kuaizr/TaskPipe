@@ -1,5 +1,6 @@
 import logging
 import asyncio # Added for CompiledGraph.invoke_async
+from dataclasses import dataclass, field
 from typing import Any, Callable, Optional, Dict, List, Tuple, Set, Union
 from collections import deque
 
@@ -14,6 +15,15 @@ logger = logging.getLogger(__name__)
 if not logger.hasHandlers(): # Avoid duplicate handlers if already configured
     logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 
+
+@dataclass
+class EdgeDefinition:
+    source: str
+    dest: str
+    data_mapping: Dict[str, str] = field(default_factory=dict)
+    static_inputs: Dict[str, Any] = field(default_factory=dict)
+    branch: Optional[str] = None
+
 class WorkflowGraph:
     """
     A builder class for defining graph nodes (Runnable instances) and edges
@@ -22,9 +32,10 @@ class WorkflowGraph:
     def __init__(self, name: Optional[str] = None, use_cache: bool = False):
         self.name: str = name or f"WorkflowGraph_{id(self)}"
         self.nodes: Dict[str, Runnable] = {}
-        self.edges: Dict[str, List[Tuple[str, Optional[Callable[[Any, Dict[str, Any]], Any]]]]] = {}
+        self.edges: Dict[str, List[EdgeDefinition]] = {}
         self._adj: Dict[str, List[str]] = {} 
         self._in_degree: Dict[str, int] = {} 
+        self._edge_lookup: Dict[Tuple[str, str, Optional[str]], EdgeDefinition] = {}
         self.entry_points: List[str] = []
         self.output_node_names: List[str] = []
         self.use_cache = use_cache
@@ -51,16 +62,37 @@ class WorkflowGraph:
     def add_edge(self,
                  source_node_name: str,
                  dest_node_name: str,
-                 input_mapper: Optional[Callable[[Any, Dict[str, Any]], Any]] = None):
-        if source_node_name not in self.nodes:
+                 data_mapping: Optional[Dict[str, str]] = None,
+                 static_inputs: Optional[Dict[str, Any]] = None,
+                 branch: Optional[str] = None) -> EdgeDefinition:
+        if source_node_name != "__static__" and source_node_name not in self.nodes:
             raise ValueError(f"Source node '{source_node_name}' not found in graph '{self.name}'.")
         if dest_node_name not in self.nodes:
             raise ValueError(f"Destination node '{dest_node_name}' not found in graph '{self.name}'.")
 
-        self.edges.setdefault(source_node_name, []).append((dest_node_name, input_mapper))
-        self._adj.setdefault(source_node_name, []).append(dest_node_name) 
-        self._in_degree[dest_node_name] = self._in_degree.get(dest_node_name, 0) + 1 
-        return self # Allow chaining
+        key = (source_node_name, dest_node_name, branch)
+        existing_edge = self._edge_lookup.get(key)
+        if existing_edge:
+            if data_mapping:
+                existing_edge.data_mapping.update(data_mapping)
+            if static_inputs:
+                existing_edge.static_inputs.update(static_inputs)
+            return existing_edge
+
+        edge = EdgeDefinition(
+            source=source_node_name,
+            dest=dest_node_name,
+            data_mapping=dict(data_mapping or {}),
+            static_inputs=dict(static_inputs or {}),
+            branch=branch
+        )
+        self.edges.setdefault(source_node_name, []).append(edge)
+        self._edge_lookup[key] = edge
+
+        if source_node_name != "__static__":
+            self._adj.setdefault(source_node_name, []).append(dest_node_name)
+            self._in_degree[dest_node_name] = self._in_degree.get(dest_node_name, 0) + 1
+        return edge
 
     def set_entry_point(self, node_name: str) -> 'WorkflowGraph':
         if node_name not in self.nodes:
@@ -77,21 +109,30 @@ class WorkflowGraph:
         return self
 
     def to_json(self) -> Dict[str, Any]:
-        nodes_payload = [
-            {
-                "name": node_name,
-                "ref": node_name,
-                "type": runnable.__class__.__name__
-            }
-            for node_name, runnable in self.nodes.items()
-        ]
+        nodes_payload = []
+        for node_name, runnable in self.nodes.items():
+            nodes_payload.append(
+                {
+                    "id": node_name,
+                    "ref": node_name,
+                    "type": runnable.__class__.__name__,
+                    "input_schema": runnable.describe_input_schema(),
+                    "output_schema": runnable.describe_output_schema(),
+                }
+            )
 
-        edges_payload: List[Dict[str, str]] = []
-        for source, destinations in self.edges.items():
-            for dest, mapper in destinations:
-                if mapper is not None:
-                    raise ValueError("WorkflowGraph.to_json currently does not support serializing input_mapper functions.")
-                edges_payload.append({"source": source, "dest": dest})
+        edges_payload: List[Dict[str, Any]] = []
+        for source, edges in self.edges.items():
+            for edge in edges:
+                edges_payload.append(
+                    {
+                        "source": edge.source,
+                        "dest": edge.dest,
+                        "data_mapping": edge.data_mapping,
+                        "static_inputs": edge.static_inputs,
+                        "branch": edge.branch,
+                    }
+                )
 
         return {
             "name": self.name,
@@ -123,9 +164,13 @@ class WorkflowGraph:
             graph.add_node(runnable_instance, node_name=node_name)
 
         for edge_spec in json_data.get("edges", []):
-            if edge_spec.get("input_mapper") not in (None, "None"):
-                raise ValueError("WorkflowGraph.from_json currently does not support deserializing input_mapper references.")
-            graph.add_edge(edge_spec["source"], edge_spec["dest"])
+            graph.add_edge(
+                edge_spec.get("source", "__static__"),
+                edge_spec["dest"],
+                data_mapping=edge_spec.get("data_mapping") or {},
+                static_inputs=edge_spec.get("static_inputs") or {},
+                branch=edge_spec.get("branch")
+            )
 
         for entry_name in json_data.get("entry_points", []):
             graph.set_entry_point(entry_name)

@@ -10,13 +10,13 @@ from .runnables import (
     ExecutionContext,
     InMemoryExecutionContext,
     NO_INPUT,
-    _default_cache_key_generator,
     Pipeline as SyncPipeline, # For operator fallback if needed
     BranchAndFanIn as SyncBranchAndFanIn,
     Conditional as SyncConditional,
     While as SyncWhile,
     _PendingConditional as _SyncPendingConditional
 )
+from pydantic import BaseModel, create_model
 
 logger = logging.getLogger(__name__)
 
@@ -31,7 +31,7 @@ class AsyncRunnable(Runnable):
         effective_context = context if context is not None else InMemoryExecutionContext(
             initial_input=input_data if input_data is not NO_INPUT else None)
 
-        prepared_input_for_invoke = await self._prepare_input_payload_async(input_data, effective_context)
+        prepared_input_for_invoke = self._prepare_input_payload(input_data, effective_context)
         self._emit_node_status(effective_context, "start")
         cache_key = None # Initialize
         if self.use_cache:
@@ -132,36 +132,6 @@ class AsyncRunnable(Runnable):
         else:
             self._emit_node_status(effective_context, "failed", {"exception": "Unknown"})
             raise RuntimeError(f"AsyncRunnable '{self.name}': Exited retry loop unexpectedly without result or exception.")
-
-    async def _context_inputs_from_declaration_async(self, context: Optional[ExecutionContext]) -> Dict[str, Any]:
-        if not self.input_declaration or context is None:
-            return {}
-
-        if isinstance(self.input_declaration, str):
-            return {"_input": context.get_output(self.input_declaration)}
-
-        if isinstance(self.input_declaration, dict):
-            resolved: Dict[str, Any] = {}
-            for param_name, source_key in self.input_declaration.items():
-                if isinstance(source_key, str):
-                    resolved[param_name] = context.get_output(source_key)
-                else:
-                    resolved[param_name] = source_key
-            return resolved
-
-        if callable(self.input_declaration):
-            if asyncio.iscoroutinefunction(self.input_declaration):
-                value = await self.input_declaration(context)
-            else:
-                value = self.input_declaration(context)
-            return self._normalize_callable_input_value(value)
-
-        raise TypeError("input_declaration must be a str, dict, or callable.")
-
-    async def _prepare_input_payload_async(self, direct_input: Any, effective_context: Optional[ExecutionContext]) -> Dict[str, Any]:
-        context_inputs = await self._context_inputs_from_declaration_async(effective_context)
-        return self._merge_input_payloads(context_inputs, direct_input)
-
 
     async def check_async(self, data_from_invoke: Any,
                           context: Optional[ExecutionContext] = None) -> bool:
@@ -270,13 +240,13 @@ class _AsyncPendingConditional:
 
 class AsyncPipeline(AsyncRunnable):
     def __init__(self, first: Runnable, second: Runnable, name: Optional[str] = None, **kwargs):
-        super().__init__(name or f"AsyncPipeline[{first.name}_then_{second.name}]", **kwargs)
         if not isinstance(first, Runnable) or not isinstance(second, Runnable):
             raise TypeError("Both 'first' and 'second' must be Runnable instances.")
         self.first = first
         self.second = second
-        if self.input_declaration is None and first.input_declaration is not None:
-            self.input_declaration = first.input_declaration
+        self.InputModel = first._input_model_cls
+        self.OutputModel = second._output_model_cls
+        super().__init__(name or f"AsyncPipeline[{first.name}_then_{second.name}]", **kwargs)
 
     async def _internal_invoke_async(self, input_data: Any, context: ExecutionContext) -> Any:
         context.log_event(f"Node '{self.name}': First task '{self.first.name}' starting.")
@@ -301,10 +271,14 @@ class AsyncPipeline(AsyncRunnable):
 
 class AsyncConditional(AsyncRunnable):
     def __init__(self, condition_r: Runnable, true_r: Runnable, false_r: Runnable, name: Optional[str] = None, **kwargs):
-        super().__init__(name or f"AsyncCond[{condition_r.name}?{true_r.name}:{false_r.name}]", **kwargs)
         self.condition_r = condition_r
         self.true_r = true_r
         self.false_r = false_r
+        if set(true_r._output_model_cls.__fields__.keys()) != set(false_r._output_model_cls.__fields__.keys()):
+            raise ValueError("AsyncConditional 的 true/false 分支必须拥有兼容的 OutputModel。")
+        self.InputModel = condition_r._input_model_cls
+        self.OutputModel = true_r._output_model_cls
+        super().__init__(name or f"AsyncCond[{condition_r.name}?{true_r.name}:{false_r.name}]", **kwargs)
 
     async def _internal_invoke_async(self, input_data: Any, context: ExecutionContext) -> Any:
         context.log_event(f"Node '{self.name}': Evaluating condition '{self.condition_r.name}'.")
@@ -321,10 +295,14 @@ class AsyncConditional(AsyncRunnable):
 
 class AsyncWhile(AsyncRunnable):
     def __init__(self, condition_check_runnable: Runnable, body_runnable: Runnable, max_loops: int = 100, name: Optional[str] = None, **kwargs):
-        super().__init__(name or f"AsyncWhile[{condition_check_runnable.name}_do_{body_runnable.name}]", **kwargs)
         self.condition_check_runnable = condition_check_runnable
         self.body_runnable = body_runnable
         self.max_loops = max_loops
+        loop_name = name or f"AsyncWhile[{condition_check_runnable.name}_do_{body_runnable.name}]"
+        body_output_cls = body_runnable._output_model_cls
+        self.InputModel = condition_check_runnable._input_model_cls
+        self.OutputModel = create_model(f"{loop_name}Output", history=(List[body_output_cls], ...))
+        super().__init__(loop_name, **kwargs)
 
     async def _internal_invoke_async(self, input_data: Any, context: ExecutionContext) -> List[Any]:
         loop_count = 0
@@ -357,7 +335,7 @@ class AsyncWhile(AsyncRunnable):
             context.log_event(f"Node '{self.name}': Loop exited due to max_loops ({self.max_loops}) reached.")
         
         context.log_event(f"Node '{self.name}': Loop finished. Returning {len(all_body_outputs)} outputs.")
-        return all_body_outputs
+        return {"history": all_body_outputs}
 
 
 class AgentLoop(AsyncRunnable):
@@ -366,9 +344,12 @@ class AgentLoop(AsyncRunnable):
     当生成器返回普通结果（非 Runnable）时循环结束。
     """
     def __init__(self, generator: Runnable, max_iterations: int = 25, name: Optional[str] = None, **kwargs):
-        super().__init__(name or f"AgentLoop[{generator.name}]", **kwargs)
         self.generator = generator
         self.max_iterations = max_iterations
+        loop_name = name or f"AgentLoop[{generator.name}]"
+        self.InputModel = generator._input_model_cls
+        self.OutputModel = create_model(f"{loop_name}Output", result=(Any, ...))
+        super().__init__(loop_name, **kwargs)
 
     async def _internal_invoke_async(self, input_data: Any, context: ExecutionContext) -> Any:
         current_payload = input_data
@@ -387,7 +368,7 @@ class AgentLoop(AsyncRunnable):
                 continue
 
             context.log_event(f"Node '{self.name}': Generator returned terminal result. Loop completed.")
-            return generated
+            return {"result": generated}
 
         raise RuntimeError(
             f"AgentLoop '{self.name}' exceeded max_iterations ({self.max_iterations}) without producing a terminal result."
@@ -399,11 +380,27 @@ class AsyncBranchAndFanIn(AsyncRunnable):
     
     def __init__(self, tasks_dict: Dict[str, Runnable], # Changed to Runnable
                  name: Optional[str] = None, **kwargs):
-        super().__init__(name or f"AsyncBranchFanIn_{'_'.join(tasks_dict.keys())}", **kwargs)
         if not isinstance(tasks_dict, dict) or not all(isinstance(r, Runnable) for r in tasks_dict.values()):
             raise TypeError("tasks_dict must be a dictionary of Runnables.")
         self.tasks_dict = tasks_dict
+        base_name = name or f"AsyncBranchFanIn_{'_'.join(tasks_dict.keys())}"
+        self.InputModel = self._ensure_uniform_input_model()
+        self.OutputModel = self._build_output_model(base_name)
         # max_workers is implicit with asyncio.gather
+        super().__init__(base_name, **kwargs)
+
+    def _ensure_uniform_input_model(self) -> Type[BaseModel]:
+        models = {task._input_model_cls for task in self.tasks_dict.values()}
+        if len(models) != 1:
+            raise ValueError("AsyncBranchAndFanIn 所有子任务必须共享相同的 InputModel。")
+        return next(iter(models))
+
+    def _build_output_model(self, base_name: str) -> Type[BaseModel]:
+        fields = {
+            key: (task._output_model_cls, ...)
+            for key, task in self.tasks_dict.items()
+        }
+        return create_model(f"{base_name}Output", **fields)
 
     async def _internal_invoke_async(self, input_data: Any, 
                                    context: ExecutionContext) -> Dict[str, Any]:
@@ -413,10 +410,7 @@ class AsyncBranchAndFanIn(AsyncRunnable):
         
         # Create coroutines for each task using invoke_async
         coroutines_map = {
-            key: task.invoke_async(
-                input_data if not task.input_declaration else NO_INPUT,
-                context
-            )
+            key: task.invoke_async(input_data, context)
             for key, task in self.tasks_dict.items()
         }
         
@@ -453,21 +447,35 @@ class AsyncSourceParallel(AsyncRunnable):
     
     def __init__(self, tasks_dict: Dict[str, Runnable], # Changed to Runnable
                  name: Optional[str] = None, **kwargs):
-        super().__init__(name or f"AsyncSourcePar_{'_'.join(tasks_dict.keys())}", **kwargs)
         if not isinstance(tasks_dict, dict) or not all(isinstance(r, Runnable) for r in tasks_dict.values()):
             raise TypeError("tasks_dict must be a dictionary of Runnables.")
         self.tasks_dict = tasks_dict
+        base_name = name or f"AsyncSourcePar_{'_'.join(tasks_dict.keys())}"
+        self.InputModel = self._ensure_uniform_input_model()
+        self.OutputModel = self._build_output_model(base_name)
+        super().__init__(base_name, **kwargs)
+
+    def _ensure_uniform_input_model(self) -> Type[BaseModel]:
+        models = {task._input_model_cls for task in self.tasks_dict.values()}
+        if len(models) != 1:
+            raise ValueError("AsyncSourceParallel 所有子任务必须共享相同的 InputModel。")
+        return next(iter(models))
+
+    def _build_output_model(self, base_name: str) -> Type[BaseModel]:
+        fields = {
+            key: (task._output_model_cls, ...)
+            for key, task in self.tasks_dict.items()
+        }
+        return create_model(f"{base_name}Output", **fields)
 
     async def _internal_invoke_async(self, input_data: Any, 
                                    context: ExecutionContext) -> Dict[str, Any]:
-        unwrapped_input = self._unwrap_input_payload(input_data)
-        actual_input = context.initial_input if unwrapped_input is NO_INPUT else unwrapped_input
         context.log_event(
             f"Node '{self.name}': Starting async parallel source execution for "
-            f"{len(self.tasks_dict)} tasks. Input type: {type(actual_input).__name__}")
+            f"{len(self.tasks_dict)} tasks. Input type: {type(input_data).__name__}")
         
         coroutines_map = {
-            key: task.invoke_async(actual_input, context) # Using invoke_async
+            key: task.invoke_async(input_data, context)
             for key, task in self.tasks_dict.items()
         }
         

@@ -64,7 +64,10 @@ class AsyncRunnable(Runnable):
             try:
                 execution_input_payload = self._apply_input_model(prepared_input_for_invoke)
                 result_raw = await self._internal_invoke_async(execution_input_payload, effective_context)
-                result = self._apply_output_model(result_raw)
+                if isinstance(result_raw, Runnable):
+                    result = result_raw
+                else:
+                    result = self._apply_output_model(result_raw)
                 if self.use_cache and cache_key is not None: 
                     self._invoke_cache[cache_key] = result
                 effective_context.log_event(
@@ -265,7 +268,7 @@ class AsyncPipeline(AsyncRunnable):
         entry_second, exit_second = self.second._expand_to_graph(graph, helper)
         for parent in exit_first:
             for child in entry_second:
-                graph.add_edge(parent, child)
+                helper.connect_by_name(graph, parent, child)
         return entry_first, exit_second
 
 
@@ -274,7 +277,9 @@ class AsyncConditional(AsyncRunnable):
         self.condition_r = condition_r
         self.true_r = true_r
         self.false_r = false_r
-        if set(true_r._output_model_cls.__fields__.keys()) != set(false_r._output_model_cls.__fields__.keys()):
+        true_fields = set(getattr(true_r._output_model_cls, "model_fields", {}).keys())
+        false_fields = set(getattr(false_r._output_model_cls, "model_fields", {}).keys())
+        if true_fields != false_fields:
             raise ValueError("AsyncConditional 的 true/false 分支必须拥有兼容的 OutputModel。")
         self.InputModel = condition_r._input_model_cls
         self.OutputModel = true_r._output_model_cls

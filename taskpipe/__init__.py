@@ -13,6 +13,9 @@ from .runnables import (
     SourceParallel,
     While,
     MergeInputs,
+    Router,
+    ScriptRunnable,
+    task,
     NO_INPUT
 )
 
@@ -41,7 +44,7 @@ __all__ = [
     'ExecutionContext', 'InMemoryExecutionContext', 'Runnable', 'NO_INPUT',
     # Sync Runnables
     'SimpleTask', 'Pipeline', 'Conditional', 'BranchAndFanIn',
-    'SourceParallel', 'While', 'MergeInputs',
+    'SourceParallel', 'While', 'MergeInputs', 'Router', 'ScriptRunnable', 'task',
     # AsyncRunnable base
     'AsyncRunnable',
     # Async Composers

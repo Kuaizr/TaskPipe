@@ -5,7 +5,7 @@ from typing import Any, Callable, Optional, Dict, List, Tuple, Set, Union
 from collections import deque
 
 # Assuming runnables.py is in the same directory or accessible via PYTHONPATH
-from .runnables import Runnable, ExecutionContext, InMemoryExecutionContext, NO_INPUT, SimpleTask
+from .runnables import Runnable, ExecutionContext, InMemoryExecutionContext, NO_INPUT, SimpleTask, BaseModel
 # To allow CompiledGraph to be an AsyncRunnable if desired, or to call invoke_async
 from .async_runnables import AsyncRunnable 
 from .registry import RunnableRegistry
@@ -23,6 +23,7 @@ class EdgeDefinition:
     data_mapping: Dict[str, str] = field(default_factory=dict)
     static_inputs: Dict[str, Any] = field(default_factory=dict)
     branch: Optional[str] = None
+    edge_id: str = ""
 
 class WorkflowGraph:
     """
@@ -84,7 +85,8 @@ class WorkflowGraph:
             dest=dest_node_name,
             data_mapping=dict(data_mapping or {}),
             static_inputs=dict(static_inputs or {}),
-            branch=branch
+            branch=branch,
+            edge_id=f"{source_node_name}->{dest_node_name}#{len(self.edges.get(source_node_name, []))}"
         )
         self.edges.setdefault(source_node_name, []).append(edge)
         self._edge_lookup[key] = edge
@@ -114,6 +116,7 @@ class WorkflowGraph:
             nodes_payload.append(
                 {
                     "id": node_name,
+                    "name": node_name,
                     "ref": node_name,
                     "type": runnable.__class__.__name__,
                     "input_schema": runnable.describe_input_schema(),
@@ -147,7 +150,7 @@ class WorkflowGraph:
         graph = cls(name=json_data.get("name"))
 
         for node_spec in json_data.get("nodes", []):
-            node_name = node_spec["name"]
+            node_name = node_spec.get("id") or node_spec.get("name")
             registry_key = node_spec.get("ref", node_name)
             if isinstance(registry, RunnableRegistry):
                 runnable_instance = registry.get(registry_key)
@@ -216,7 +219,8 @@ class WorkflowGraph:
             next_ready: List[str] = []
             for node in stage_nodes:
                 visited.add(node)
-                for child, _ in self.edges.get(node, []):
+                for edge in self.edges.get(node, []):
+                    child = edge.dest
                     in_degree[child] = max(0, in_degree.get(child, 0) - 1)
                     if in_degree[child] == 0:
                         next_ready.append(child)
@@ -260,120 +264,230 @@ class WorkflowGraph:
         )
 
 
-class CompiledGraph(Runnable): # Can also inherit AsyncRunnable if it implements all its abstract methods
+class CompiledGraph(Runnable):
+    class InputModel(BaseModel):
+        payload: Any | None = None
+
+    class OutputModel(BaseModel):
+        payload: Any | None = None
     """
-    The runnable runtime representation of a WorkflowGraph.
-    Now supports both synchronous and asynchronous execution.
+    Runtime representation that executes WorkflowGraph using explicit data mappings
+    and an activation queue capable of handling control-flow branches.
     """
+
     def __init__(self,
                  name: str,
                  nodes_map: Dict[str, Runnable],
-                 edges_map: Dict[str, List[Tuple[str, Optional[Callable]]]],
+                 edges_map: Dict[str, List[EdgeDefinition]],
                  sorted_node_names: List[str],
                  entry_point_names: List[str],
                  output_node_names: List[str],
                  graph_definition_name: str,
                  execution_stages: Optional[List[List[str]]] = None,
-                 **kwargs): 
-        super().__init__(name=name, **kwargs) # Runnable's __init__
+                 **kwargs):
+        super().__init__(name=name, **kwargs)
         self.nodes: Dict[str, Runnable] = nodes_map
-        self.edges: Dict[str, List[Tuple[str, Optional[Callable]]]] = edges_map
+        self.edges: Dict[str, List[EdgeDefinition]] = edges_map
         self.sorted_nodes: List[str] = sorted_node_names
         self.entry_points: List[str] = entry_point_names
         self.output_nodes: List[str] = output_node_names
-        self.graph_def_name: str = graph_definition_name 
+        self.graph_def_name: str = graph_definition_name
         self.execution_stages: List[List[str]] = execution_stages or [sorted_node_names]
 
-        self._node_parents_info: Dict[str, List[Tuple[str, Optional[Callable]]]] = {n: [] for n in self.nodes}
-        for source_name, destinations in self.edges.items():
-            for dest_name, mapper_fn in destinations:
-                self._node_parents_info[dest_name].append((source_name, mapper_fn))
+        self._incoming_edges: Dict[str, List[EdgeDefinition]] = {n: [] for n in self.nodes}
+        self._branch_edges: Dict[str, List[EdgeDefinition]] = {n: [] for n in self.nodes}
+        self._static_inputs: Dict[str, Dict[str, Any]] = {n: {} for n in self.nodes}
+        for source_name, edges in self.edges.items():
+            for edge in edges:
+                if edge.source == "__static__":
+                    self._static_inputs[edge.dest].update(edge.static_inputs)
+                    continue
+                self._incoming_edges.setdefault(edge.dest, []).append(edge)
+                if edge.static_inputs:
+                    self._static_inputs[edge.dest].update(edge.static_inputs)
+                if edge.branch:
+                    self._branch_edges.setdefault(edge.dest, []).append(edge)
 
-    def _prepare_node_input(self, node_name: str, graph_input_data: Any, current_context: ExecutionContext) -> Any:
-        node_runnable = self.nodes[node_name]
-        current_node_input = NO_INPUT
+    def _apply_input_model(self, payload: Any) -> Any:
+        return payload
 
-        if node_runnable.input_declaration:
-            current_context.log_event(f"Graph '{self.name}', Node '{node_name}': Has input_declaration. Will fetch from context.")
-            # Input will be resolved by the node's invoke/invoke_async method itself from context
-        else:
-            parent_edges_to_this_node = self._node_parents_info.get(node_name, [])
-            
-            if node_name in self.entry_points and not parent_edges_to_this_node:
-                current_node_input = graph_input_data
-                current_context.log_event(f"Graph '{self.name}', Node '{node_name}': Is entry point, using graph's input_data.")
-            elif len(parent_edges_to_this_node) == 1:
-                source_parent_name, input_mapper_fn = parent_edges_to_this_node[0]
-                parent_output = current_context.get_output(source_parent_name)
-                if input_mapper_fn:
-                    # input_mapper_fn could be async, but current signature is sync.
-                    # If mapper needs to be async, this part requires more changes.
-                    current_node_input = input_mapper_fn(parent_output, current_context.node_outputs.copy())
-                    current_context.log_event(f"Graph '{self.name}', Node '{node_name}': Input from parent '{source_parent_name}' via mapper.")
-                else:
-                    current_node_input = parent_output
-                    current_context.log_event(f"Graph '{self.name}', Node '{node_name}': Input from parent '{source_parent_name}' (direct).")
-            elif len(parent_edges_to_this_node) > 1:
-                current_context.log_event(
-                    f"Graph '{self.name}', Node '{node_name}': Has multiple parents and no input_declaration. "
-                    "Input remains NO_INPUT. Node must handle this or declare inputs."
-                )
-                logger.warning(
-                    f"Node '{node_name}' in graph '{self.name}' has multiple incoming edges but no input_declaration. "
-                    "It will receive NO_INPUT directly."
-                )
-        return current_node_input
+    def _apply_output_model(self, result: Any) -> Any:
+        return result
 
     def _internal_invoke(self, input_data: Any, context: ExecutionContext) -> Any:
-        # This is the synchronous execution path
         logger.info(f"CompiledGraph '{self.name}' (from '{self.graph_def_name}'): Starting SYNC execution.")
-        internal_graph_context = InMemoryExecutionContext(initial_input=input_data, parent_context=context)
-        internal_graph_context.log_event(f"Graph '{self.name}': SYNC internal context created. Initial input type: {type(input_data).__name__}")
-
-        for stage in self.execution_stages:
-            for node_name in stage:
-                node_runnable = self.nodes[node_name]
-                internal_graph_context.log_event(f"Graph '{self.name}': SYNC Processing node '{node_name}' (type: {type(node_runnable).__name__}).")
-                
-                current_node_input = self._prepare_node_input(node_name, input_data, internal_graph_context)
-                
-                try:
-                    node_runnable.invoke(current_node_input, internal_graph_context) # SYNC invoke
-                except Exception as e:
-                    logger.error(f"CompiledGraph '{self.name}': SYNC Error executing node '{node_name}': {e}", exc_info=True)
-                    internal_graph_context.log_event(f"Graph '{self.name}', Node '{node_name}': SYNC FAILED with {type(e).__name__}: {str(e)[:100]}.")
-                    raise e
-
-        return self._collect_final_results(internal_graph_context)
+        internal_context = InMemoryExecutionContext(initial_input=input_data, parent_context=context)
+        internal_context.log_event(f"Graph '{self.name}': SYNC internal context created. Initial input type: {type(input_data).__name__}")
+        self._execute_sync(input_data, internal_context)
+        if context:
+            context.node_status_events.extend(getattr(internal_context, "node_status_events", []))
+        return self._collect_final_results(internal_context)
 
     async def _internal_invoke_async(self, input_data: Any, context: ExecutionContext) -> Any:
-        # This is the asynchronous execution path
         logger.info(f"CompiledGraph '{self.name}' (from '{self.graph_def_name}'): Starting ASYNC execution.")
-        internal_graph_context = InMemoryExecutionContext(initial_input=input_data, parent_context=context)
-        internal_graph_context.log_event(f"Graph '{self.name}': ASYNC internal context created. Initial input type: {type(input_data).__name__}")
+        internal_context = InMemoryExecutionContext(initial_input=input_data, parent_context=context)
+        internal_context.log_event(f"Graph '{self.name}': ASYNC internal context created. Initial input type: {type(input_data).__name__}")
+        await self._execute_async(input_data, internal_context)
+        if context:
+            context.node_status_events.extend(getattr(internal_context, "node_status_events", []))
+        return self._collect_final_results(internal_context)
 
-        for stage in self.execution_stages:
-            stage_tasks = []
-            for node_name in stage:
-                node_runnable = self.nodes[node_name]
-                internal_graph_context.log_event(f"Graph '{self.name}': ASYNC Processing node '{node_name}' (type: {type(node_runnable).__name__}).")
+    def _execute_sync(self, graph_input: Any, internal_context: ExecutionContext) -> None:
+        state = self._build_initial_state(graph_input)
+        queue = state["queue"]
+        while queue:
+            node = queue.popleft()
+            if state["node_states"][node] != "pending":
+                continue
+            payload = state["pending_payloads"][node]
+            node_input = payload if payload else NO_INPUT
+            try:
+                result = self.nodes[node].invoke(node_input, internal_context)
+            except Exception as exc:
+                internal_context.log_event(f"Graph '{self.name}', Node '{node}': FAILED with {type(exc).__name__}: {str(exc)[:120]}")
+                raise
+            state["node_states"][node] = "completed"
+            internal_context.add_output(node, result)
+            result_plain = Runnable._model_to_plain(result)
+            self._propagate_output(node, result_plain, state, queue, internal_context)
 
-                current_node_input = self._prepare_node_input(node_name, input_data, internal_graph_context)
-                stage_tasks.append((node_name, node_runnable.invoke_async(current_node_input, internal_graph_context)))
+    async def _execute_async(self, graph_input: Any, internal_context: ExecutionContext) -> None:
+        state = self._build_initial_state(graph_input)
+        queue = state["queue"]
+        while queue:
+            node = queue.popleft()
+            if state["node_states"][node] != "pending":
+                continue
+            payload = state["pending_payloads"][node]
+            node_input = payload if payload else NO_INPUT
+            try:
+                result = await self.nodes[node].invoke_async(node_input, internal_context)
+            except Exception as exc:
+                internal_context.log_event(f"Graph '{self.name}', Node '{node}': ASYNC FAILED with {type(exc).__name__}: {str(exc)[:120]}")
+                raise
+            state["node_states"][node] = "completed"
+            internal_context.add_output(node, result)
+            result_plain = Runnable._model_to_plain(result)
+            self._propagate_output(node, result_plain, state, queue, internal_context)
 
-            if stage_tasks:
-                try:
-                    await asyncio.gather(*(task for _, task in stage_tasks))
-                except Exception as e:
-                    failed_nodes = [name for name, _ in stage_tasks]
-                    logger.error(f"CompiledGraph '{self.name}': ASYNC Error executing stage {failed_nodes}: {e}", exc_info=True)
-                    for failing_name in failed_nodes:
-                        internal_graph_context.log_event(
-                            f"Graph '{self.name}', Node '{failing_name}': ASYNC FAILED due to stage error {type(e).__name__}: {str(e)[:100]}."
-                        )
-                    raise
-        
-        return self._collect_final_results(internal_graph_context)
+    def _build_initial_state(self, graph_input: Any) -> Dict[str, Any]:
+        queue = deque()
+        node_states = {node: "pending" for node in self.nodes}
+        pending_payloads = {node: dict(self._static_inputs.get(node, {})) for node in self.nodes}
+        incoming_edge_state: Dict[str, Dict[str, str]] = {
+            node: {edge.edge_id: "waiting" for edge in self._incoming_edges.get(node, [])}
+            for node in self.nodes
+        }
+        graph_input_payload = self._convert_to_payload(graph_input)
+
+        for node in self.nodes:
+            if not self._incoming_edges.get(node):
+                if node in self.entry_points and graph_input_payload:
+                    pending_payloads[node].update(graph_input_payload)
+                queue.append(node)
+
+        return {
+            "queue": queue,
+            "node_states": node_states,
+            "pending_payloads": pending_payloads,
+            "incoming_edge_state": incoming_edge_state,
+        }
+
+    def _propagate_output(self,
+                          node: str,
+                          parent_dict: Dict[str, Any],
+                          state: Dict[str, Any],
+                          queue: deque,
+                          internal_context: ExecutionContext) -> None:
+        pending_payloads = state["pending_payloads"]
+        incoming_edge_state = state["incoming_edge_state"]
+
+        for edge in self.edges.get(node, []):
+            if edge.source == "__static__":
+                continue
+            dest = edge.dest
+            if state["node_states"][dest] == "skipped":
+                continue
+
+            if not self._edge_activated(edge, parent_dict):
+                incoming_edge_state[dest][edge.edge_id] = "inactive"
+                self._maybe_schedule_node(dest, state, queue, internal_context)
+                continue
+
+            mapped = self._apply_mapping(parent_dict, edge.data_mapping)
+            pending_payloads[dest].update(mapped)
+            incoming_edge_state[dest][edge.edge_id] = "provided"
+            self._maybe_schedule_node(dest, state, queue, internal_context)
+
+    def _edge_activated(self, edge: EdgeDefinition, parent_dict: Dict[str, Any]) -> bool:
+        if edge.branch is None:
+            return True
+        decision = parent_dict.get("decision")
+        if decision is None:
+            return False
+        value = str(decision).lower()
+        return value == str(edge.branch).lower()
+
+    def _maybe_schedule_node(self,
+                             node: str,
+                             state: Dict[str, Any],
+                             queue: deque,
+                             internal_context: ExecutionContext) -> None:
+        if state["node_states"][node] != "pending":
+            return
+        incoming = state["incoming_edge_state"].get(node, {})
+        if any(status == "waiting" for status in incoming.values()):
+            return
+
+        has_data = any(status == "provided" for status in incoming.values()) or bool(state["pending_payloads"][node])
+        if not incoming and not state["pending_payloads"][node] and node not in self.entry_points:
+            has_data = False
+
+        branch_edges = self._branch_edges.get(node, [])
+        if branch_edges:
+            branch_provided = any(incoming.get(edge.edge_id) == "provided" for edge in branch_edges)
+            if not branch_provided:
+                self._mark_node_skipped(node, state, queue, internal_context)
+                return
+
+        if has_data or not incoming:
+            queue.append(node)
+            return
+
+        self._mark_node_skipped(node, state, queue, internal_context)
+
+    def _mark_node_skipped(self,
+                           node: str,
+                           state: Dict[str, Any],
+                           queue: deque,
+                           internal_context: ExecutionContext) -> None:
+        if state["node_states"][node] != "pending":
+            return
+        state["node_states"][node] = "skipped"
+        internal_context.notify_status(node, "skipped", {})
+        for edge in self.edges.get(node, []):
+            if edge.source == "__static__":
+                continue
+            dest = edge.dest
+            if state["node_states"][dest] == "pending":
+                state["incoming_edge_state"][dest][edge.edge_id] = "inactive"
+                self._maybe_schedule_node(dest, state, queue, internal_context)
+
+    @staticmethod
+    def _convert_to_payload(value: Any) -> Dict[str, Any]:
+        return Runnable._model_to_plain(value)
+
+    @staticmethod
+    def _apply_mapping(parent_dict: Dict[str, Any], mapping: Dict[str, str]) -> Dict[str, Any]:
+        if not mapping or mapping == {"*": "*"}:
+            return dict(parent_dict)
+        projected: Dict[str, Any] = {}
+        for target_field, source_field in mapping.items():
+            if source_field == "*":
+                projected[target_field] = parent_dict
+            else:
+                projected[target_field] = parent_dict.get(source_field)
+        return projected
 
     def _collect_final_results(self, internal_graph_context: ExecutionContext) -> Any:
         if not self.output_nodes:

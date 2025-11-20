@@ -12,12 +12,14 @@ from typing import (
     Dict,
     List,
     Optional,
+    Set,
     Tuple,
     Type,
     TypeVar,
     Union,
     Coroutine,
     cast,
+    get_origin,
     get_type_hints,
 )
 
@@ -194,10 +196,10 @@ class Runnable(abc.ABC):
         clone = self.copy()
         updated = dict(clone._input_bindings)
         for target_field, value in mappings.items():
-            if target_field not in clone._input_model_cls.__fields__:
+            if target_field not in getattr(clone._input_model_cls, "model_fields", {}):
                 raise ValueError(f"{clone.name}: InputModel 不包含字段 '{target_field}'")
             if isinstance(value, _OutputFieldRef):
-                source_fields = value.source._output_model_cls.__fields__
+                source_fields = getattr(value.source._output_model_cls, "model_fields", {})
                 if value.field_name not in source_fields:
                     raise ValueError(
                         f"{clone.name}: {value.source.name}.OutputModel 缺少字段 '{value.field_name}'."
@@ -234,26 +236,33 @@ class Runnable(abc.ABC):
 
     def get_config_dict(self) -> Optional[Dict[str, Any]]:
         if isinstance(self.config, BaseModel):
-            return cast(BaseModel, self.config).dict()
+            return cast(BaseModel, self.config).model_dump()
         if isinstance(self.config, dict):
             return dict(self.config)
         return None
 
 
     def describe_input_schema(self) -> Dict[str, str]:
+        fields = getattr(self._input_model_cls, "model_fields", {})
         return {
-            field_name: self._type_name(field.outer_type_)
-            for field_name, field in self._input_model_cls.__fields__.items()
+            field_name: self._type_name(field.annotation)
+            for field_name, field in fields.items()
         }
 
     def describe_output_schema(self) -> Dict[str, str]:
+        fields = getattr(self._output_model_cls, "model_fields", {})
         return {
-            field_name: self._type_name(field.outer_type_)
-            for field_name, field in self._output_model_cls.__fields__.items()
+            field_name: self._type_name(field.annotation)
+            for field_name, field in fields.items()
         }
 
     @staticmethod
     def _type_name(tp: Any) -> str:
+        if tp is None:
+            return "None"
+        origin = get_origin(tp)
+        if origin is not None:
+            return str(tp)
         try:
             return tp.__name__
         except AttributeError:
@@ -263,10 +272,10 @@ class Runnable(abc.ABC):
         if direct_input is NO_INPUT or direct_input is None:
             return {}
         if isinstance(direct_input, BaseModel):
-            return direct_input.dict()
+            return direct_input.model_dump()
         if isinstance(direct_input, dict):
             return dict(direct_input)
-        model_fields = list(self._input_model_cls.__fields__.keys())
+        model_fields = list(getattr(self._input_model_cls, "model_fields", {}).keys())
         if len(model_fields) == 1:
             return {model_fields[0]: direct_input}
         raise ValueError(
@@ -314,7 +323,7 @@ class Runnable(abc.ABC):
         if payload is None or payload is NO_INPUT:
             return {}
         if isinstance(payload, BaseModel):
-            return payload.dict()
+            return payload.model_dump()
         if isinstance(payload, dict):
             return dict(payload)
         return {"value": payload}
@@ -657,6 +666,7 @@ class Runnable(abc.ABC):
 
         for entry in entry_nodes:
             graph.set_entry_point(entry)
+            helper.ensure_static_inputs(graph, entry)
         graph.set_output_nodes(exit_nodes)
         return graph
 
@@ -743,7 +753,7 @@ def task(func: Optional[Callable] = None, *, name: Optional[str] = None):
                 super().__init__(name=runtime_name, **kwargs)
 
             def _internal_invoke(self, input_data: Any, context: ExecutionContext) -> Any:
-                payload = input_data.dict() if isinstance(input_data, BaseModel) else dict(input_data or {})
+                payload = input_data.model_dump() if isinstance(input_data, BaseModel) else dict(input_data or {})
                 if expects_context:
                     payload["context"] = context
                 result = callable_obj(**payload)
@@ -751,7 +761,7 @@ def task(func: Optional[Callable] = None, *, name: Optional[str] = None):
                     return result
                 if isinstance(result, dict):
                     return result
-                output_fields = list(self.OutputModel.__fields__.keys())
+                output_fields = list(getattr(self.OutputModel, "model_fields", {}).keys())
                 if len(output_fields) == 1:
                     return {output_fields[0]: result}
                 return result
@@ -779,7 +789,7 @@ class SimpleTask(Runnable):
         super().__init__(task_name, **kwargs)
 
     def _internal_invoke(self, input_data: Any, context: ExecutionContext) -> Any:
-        payload = input_data.dict() if isinstance(input_data, BaseModel) else dict(input_data or {})
+        payload = input_data.model_dump() if isinstance(input_data, BaseModel) else dict(input_data or {})
         if self._expects_context:
             payload.setdefault("context", context)
         result = self._callable(**payload)
@@ -787,7 +797,7 @@ class SimpleTask(Runnable):
             return result
         if isinstance(result, dict):
             return result
-        output_fields = list(self.OutputModel.__fields__.keys())
+        output_fields = list(getattr(self.OutputModel, "model_fields", {}).keys())
         if len(output_fields) == 1:
             return {output_fields[0]: result}
         return result
@@ -818,7 +828,7 @@ class Pipeline(Runnable):
         entry_second, exit_second = self.second._expand_to_graph(graph, helper)
         for parent in exit_first:
             for child in entry_second:
-                graph.add_edge(parent, child)
+                helper.connect_by_name(graph, parent, child)
         return entry_first, exit_second
 
 
@@ -827,7 +837,9 @@ class Conditional(Runnable):
         self.condition_r = condition_r
         self.true_r = true_r
         self.false_r = false_r
-        if set(true_r._output_model_cls.__fields__.keys()) != set(false_r._output_model_cls.__fields__.keys()):
+        true_fields = set(getattr(true_r._output_model_cls, "model_fields", {}).keys())
+        false_fields = set(getattr(false_r._output_model_cls, "model_fields", {}).keys())
+        if true_fields != false_fields:
             raise ValueError("Conditional 的 true/false 分支必须拥有兼容的 OutputModel。")
         self.InputModel = condition_r._input_model_cls
         self.OutputModel = true_r._output_model_cls
@@ -1036,7 +1048,7 @@ class MergeInputs(Runnable):
         super().__init__(task_name, **kwargs)
 
     def _internal_invoke(self, input_data: Any, context: ExecutionContext) -> Any:
-        payload = input_data.dict() if isinstance(input_data, BaseModel) else dict(input_data or {})
+        payload = input_data.model_dump() if isinstance(input_data, BaseModel) else dict(input_data or {})
         context.log_event(f"Node '{self.name}': Calling merge_function '{getattr(self.merge_function, '__name__', 'custom')}'.")
         return self.merge_function(**payload)
 
@@ -1077,7 +1089,7 @@ class ScriptRunnable(Runnable):
         super().__init__(name=task_name, config=config_obj, **kwargs)
 
     def _internal_invoke(self, input_data: Any, context: ExecutionContext) -> Any:
-        payload = input_data.dict() if isinstance(input_data, BaseModel) else dict(input_data or {})
+        payload = input_data.model_dump() if isinstance(input_data, BaseModel) else dict(input_data or {})
         local_vars = {key: payload.get(key) for key in self.config.input_keys}
         local_vars["context"] = context
         exec(self.config.code, {}, local_vars)
@@ -1088,6 +1100,8 @@ class ScriptRunnable(Runnable):
 class _GraphExportHelper:
     def __init__(self):
         self._name_counter: Dict[str, int] = {}
+        self._node_name_to_runnable: Dict[str, Runnable] = {}
+        self._static_attached: Set[str] = set()
 
     def _unique_name(self, base_name: Optional[str]) -> str:
         sanitized = base_name or "Node"
@@ -1099,4 +1113,46 @@ class _GraphExportHelper:
     def add_node(self, graph: 'WorkflowGraph', runnable: Runnable) -> str:
         node_name = self._unique_name(runnable.name)
         graph.add_node(runnable, node_name=node_name)
+        self._node_name_to_runnable[node_name] = runnable
+        self._attach_static_inputs(graph, runnable, node_name)
         return node_name
+
+    def connect_by_name(self,
+                        graph: 'WorkflowGraph',
+                        parent_node_name: str,
+                        child_node_name: str,
+                        branch: Optional[str] = None) -> None:
+        parent_runnable = self._node_name_to_runnable.get(parent_node_name)
+        child_runnable = self._node_name_to_runnable.get(child_node_name)
+        if parent_runnable is None or child_runnable is None:
+            raise ValueError("Graph export helper lost track of runnable references.")
+
+        data_mapping = child_runnable._dynamic_mapping_for_source(parent_runnable)
+        if not data_mapping:
+            data_mapping = self._infer_auto_mapping(parent_runnable, child_runnable)
+        graph.add_edge(parent_node_name, child_node_name, data_mapping=data_mapping, branch=branch)
+        self._attach_static_inputs(graph, child_runnable, child_node_name)
+
+    def ensure_static_inputs(self, graph: 'WorkflowGraph', node_name: str) -> None:
+        runnable = self._node_name_to_runnable.get(node_name)
+        if runnable:
+            self._attach_static_inputs(graph, runnable, node_name)
+
+    def _attach_static_inputs(self, graph: 'WorkflowGraph', runnable: Runnable, node_name: str) -> None:
+        if node_name in self._static_attached:
+            return
+        static_values = runnable._static_binding_values()
+        if static_values:
+            graph.add_edge("__static__", node_name, static_inputs=static_values)
+            self._static_attached.add(node_name)
+
+    def _infer_auto_mapping(self, parent: Runnable, child: Runnable) -> Dict[str, str]:
+        parent_fields = list(parent._output_model_cls.__fields__.keys())
+        child_fields = list(child._input_model_cls.__fields__.keys())
+        if len(parent_fields) == 1 and len(child_fields) == 1:
+            parent_schema = parent.describe_output_schema()
+            child_schema = child.describe_input_schema()
+            if parent_schema.get(parent_fields[0]) == child_schema.get(child_fields[0]):
+                return {child_fields[0]: parent_fields[0]}
+        return {"*": "*"}
+        return {"*": "*"}

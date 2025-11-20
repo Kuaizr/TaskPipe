@@ -7,7 +7,7 @@ from __future__ import annotations
 
 from pydantic import BaseModel
 
-from taskpipe import InMemoryExecutionContext, Runnable, SimpleTask
+from taskpipe import InMemoryExecutionContext, Runnable, SimpleTask, task
 
 
 class MetricsInput(BaseModel):
@@ -18,6 +18,10 @@ class MetricsInput(BaseModel):
 class MetricsResult(BaseModel):
     status: str
     summary: str
+
+
+class ReportPayload(BaseModel):
+    text: str
 
 
 class ThresholdConfig(BaseModel):
@@ -46,10 +50,9 @@ class EvaluateUsage(Runnable):
         return {"status": status, "summary": summary}
 
 
-format_report = SimpleTask(
-    lambda metrics: f"[{metrics.status.upper()}] {metrics.summary}",
-    name="FormatReport",
-)
+@task
+def format_report(metrics: MetricsResult) -> ReportPayload:
+    return ReportPayload(text=f"[{metrics.status.upper()}] {metrics.summary}")
 
 
 def main() -> None:
@@ -58,10 +61,10 @@ def main() -> None:
 
     ctx = InMemoryExecutionContext()
     healthy = pipeline.invoke({"cpu": 0.5, "ram": 0.55}, ctx)
-    print("Healthy pipeline output:", healthy)
+    print("Healthy pipeline output:", healthy.text)
 
     alert = pipeline.invoke({"cpu": 0.92, "ram": 0.4}, ctx)
-    print("Alert pipeline output:", alert)
+    print("Alert pipeline output:", alert.text)
 
     print("\nLogged events:")
     for event in ctx.event_log[-2:]:

@@ -1,5 +1,5 @@
 """
-Example: WorkflowGraph serialization + RunnableRegistry.
+Example: WorkflowGraph serialization + RunnableRegistry with explicit mappings.
 Run with: `python examples/registry_serialization.py`
 """
 
@@ -8,29 +8,56 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+from pydantic import BaseModel
+
 from taskpipe import (
     InMemoryExecutionContext,
     NO_INPUT,
     RunnableRegistry,
-    SimpleTask,
     WorkflowGraph,
+    task,
 )
 
 EXAMPLE_JSON = Path(__file__).with_name("registry_workflow.json")
 
 
+class MetricPayload(BaseModel):
+    cpu: float
+    ram: float
+
+
+class ResultPayload(BaseModel):
+    text: str
+
+
+@task
+def collect_metrics() -> MetricPayload:
+    return MetricPayload(cpu=0.63, ram=0.41)
+
+
+@task
+def normalize_metrics(cpu: float, ram: float) -> MetricPayload:
+    return MetricPayload(cpu=round(cpu * 100, 1), ram=round(ram * 100, 1))
+
+
+@task
+def persist_result(cpu: float, ram: float) -> ResultPayload:
+    return ResultPayload(text=f"Recorded CPU={cpu}%, RAM={ram}%")
+
+
 def build_graph() -> WorkflowGraph:
     graph = WorkflowGraph(name="MetricIngestion")
-    collect = SimpleTask(lambda: {"cpu": 0.63, "ram": 0.41}, name="CollectMetrics")
-    normalize = SimpleTask(lambda cpu, ram: {"cpu": round(cpu * 100, 1), "ram": round(ram * 100, 1)}, name="NormalizeMetrics")
-    persist = SimpleTask(lambda cpu, ram: f"Recorded CPU={cpu}%, RAM={ram}%", name="PersistResult")
+
+    collect = collect_metrics()
+    normalize = normalize_metrics()
+    persist = persist_result()
 
     graph.add_node(collect, "CollectMetrics")
     graph.add_node(normalize, "NormalizeMetrics")
     graph.add_node(persist, "PersistResult")
 
-    graph.add_edge("CollectMetrics", "NormalizeMetrics")
-    graph.add_edge("NormalizeMetrics", "PersistResult")
+    graph.add_edge("CollectMetrics", "NormalizeMetrics", data_mapping={"cpu": "cpu", "ram": "ram"})
+    graph.add_edge("NormalizeMetrics", "PersistResult", data_mapping={"cpu": "cpu", "ram": "ram"})
     graph.set_entry_point("CollectMetrics")
     graph.set_output_nodes(["PersistResult"])
     return graph
@@ -45,15 +72,9 @@ def export_graph(graph: WorkflowGraph) -> None:
 
 def rebuild_via_registry() -> None:
     registry = RunnableRegistry()
-    registry.register("CollectMetrics", lambda: SimpleTask(lambda: {"cpu": 0.5, "ram": 0.35}, name="CollectMetrics"))
-    registry.register(
-        "NormalizeMetrics",
-        lambda: SimpleTask(lambda cpu, ram: {"cpu": round(cpu * 100, 1), "ram": round(ram * 100, 1)}, name="NormalizeMetrics"),
-    )
-    registry.register(
-        "PersistResult",
-        lambda: SimpleTask(lambda cpu, ram: f"PERSISTED cpu={cpu}%, ram={ram}%", name="PersistResult"),
-    )
+    registry.register("CollectMetrics", collect_metrics)
+    registry.register("NormalizeMetrics", normalize_metrics)
+    registry.register("PersistResult", persist_result)
 
     with EXAMPLE_JSON.open("r", encoding="utf-8") as fp:
         payload = json.load(fp)
@@ -72,4 +93,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

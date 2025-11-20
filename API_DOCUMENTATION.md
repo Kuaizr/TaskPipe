@@ -29,7 +29,7 @@ classDiagram
     class Runnable {
         <<Abstract>>
         +name: str
-        +input_declaration: Any
+        +map_inputs(**mappings)
         +_invoke_cache: Dict
         +_check_cache: Dict
         +_custom_check_fn: Optional[Callable]
@@ -231,7 +231,7 @@ classDiagram
 - `get_output(node_name, default=None)`: 读取节点输出，可回溯父上下文。
 - `log_event(message)`: 写入事件日志。
 
-> 仍可通过 `taskpipe.NO_INPUT` 表示“没有直接输入”，此时 `Runnable` 的 `input_declaration` 会被解析。
+> 可以通过 `taskpipe.NO_INPUT` 表示“沿用 map_inputs/静态常量中声明的输入”，无需再手写上下文解析逻辑。
 
 ### 2. `taskpipe.Runnable` (ABC)
 
@@ -240,25 +240,19 @@ classDiagram
 **主要属性:**
 
 - `name: str`: `Runnable` 实例的名称。如果未提供，则基于类名和对象ID自动生成。
-- `input_declaration: Any`: 定义 `Runnable` 如何从 `ExecutionContext` 获取其输入数据，当 `invoke` 或 `invoke_async` 的 `input_data` 参数为 `NO_INPUT` 时生效。可以是：
-    - 字符串: 从上下文中获取名为该字符串的单个节点输出作为输入。
-    - 字典 (`Dict[str, str]` 或 `Dict[str, Any]`): 将字典的值（通常是上下文中的节点名）映射到字典的键（作为 `_internal_invoke` 的关键字参数）。如果值不是字符串，则直接作为参数值。
-    - 可调用对象 (`Callable[[ExecutionContext], Any]`): 一个函数，接收 `ExecutionContext`，返回实际输入数据。
-- `_invoke_cache: Dict[Any, Any]`: 内部字典，用于缓存 `invoke` 方法的结果。键由 `_cache_key_generator` 生成。
-- `_check_cache: Dict[Any, bool]`: 内部字典，用于缓存 `check` 方法的结果。键是 `data_from_invoke` 序列化后的结果。
-- `use_cache: Bool`: 是否使用cache
-- `_custom_check_fn: Optional[Callable[[Any], bool]]`: 用户定义的同步检查函数。
-- `_custom_async_check_fn: Optional[Callable[[Any], Coroutine[Any, Any, bool]]]` : 用户定义的异步检查协程函数。通过 `set_check` 方法设置。
-- `_error_handler: Optional[Union['Runnable', Callable[[ExecutionContext, Any, Exception], Any]]]`: 当此 `Runnable` 执行失败且不重试时，调用的错误处理器。可以是另一个 `Runnable` 实例或一个可调用函数。
-- `_on_start_handler: Optional[Union['Runnable', Callable[[ExecutionContext, Any], None]]]`: 在 `invoke` 方法开始执行核心逻辑前调用的处理器。可以是 `Runnable` 或可调用函数。
-- `_on_complete_handler: Optional[Union['Runnable', Callable[[ExecutionContext, Any, Optional[Exception]], None]]]`: 在 `invoke` 方法执行完毕（无论成功或失败，在所有重试和错误处理之后）时调用的处理器。可以是 `Runnable` 或可调用函数。
-- `_retry_config: Optional[Dict[str, Any]]`: 包含重试参数的字典，如 `max_attempts`, `delay_seconds`, `retry_on_exceptions`。
-- `_cache_key_generator: Callable`: 一个函数，用于根据输入数据和上下文生成缓存键。默认为 `_default_cache_key_generator`。**自定义 `cache_key_generator` 时，请务必考虑输入数据、上下文和 `input_declaration`，以确保缓存键的唯一性和有效性。**
-- `InputModel` / `OutputModel` / `ConfigModel`: 可选的 `pydantic.BaseModel` 子类，用于声明数据契约。声明后，taskpipe 会在执行前后自动做验证；`ConfigModel` 用于 `Runnable(..., config=...)` 的静态配置，并可通过 `get_config()` 或 `get_config_dict()` 导出。
+- `_invoke_cache` / `_check_cache`: 分别缓存 `invoke` 与 `check` 结果。
+- `use_cache: Bool`: 是否启用缓存。
+- `_custom_check_fn` / `_custom_async_check_fn`: 自定义同步/异步检查函数。
+- `_error_handler` / `_on_start_handler` / `_on_complete_handler`: 生命周期钩子。
+- `_retry_config`: 重试设置。
+- `_cache_key_generator`: 生成缓存键的函数，默认为 `_default_cache_key_generator`，其默认实现会考虑输入数据和 `map_inputs` 绑定。
+- `InputModel` / `OutputModel` / `ConfigModel`: `pydantic.BaseModel` 子类，用于声明输入/输出/配置契约；`InputModel` 与 `OutputModel` 现为必填。
+- `_input_bindings`: 通过 `map_inputs` 和静态常量构建的字段级依赖描述。
+- `Output`: 属性访问器，可通过 `some_task.Output.field_name` 在上游表达式中引用字段，配合 `map_inputs` 形成显式数据映射。
 
 **主要方法:**
 
-- `__init__(self, name: Optional[str] = None, input_declaration: Any = None, cache_key_generator: Optional[Callable] = None, use_cache: bool = False, config: Optional[Dict[str, Any]] = None)`: 构造函数；当声明 `ConfigModel` 时会自动校验 `config`。
+- `__init__(self, name: Optional[str] = None, cache_key_generator: Optional[Callable] = None, use_cache: bool = False, config: Optional[Dict[str, Any]] = None)`: 构造函数；当声明 `ConfigModel` 时会自动校验 `config`。
 - `invoke(self, input_data: Any = NO_INPUT, context: Optional[ExecutionContext] = None) -> Any`:
     - **同步执行** `Runnable` 的核心公共方法。
     - 管理执行流程：创建或使用 `ExecutionContext`，触发 `notify_status(..., "start")`，调用 `on_start` 钩子，解析输入数据（支持 `InputModel` 验证），检查缓存，执行重试逻辑（内部包含 `_internal_invoke` 调用和 `on_error` 处理器逻辑），最后调用 `on_complete` 钩子并触发 `success/failed` 状态。
@@ -279,6 +273,10 @@ classDiagram
     - `Runnable` 基类中的默认异步检查逻辑是简单地对数据进行布尔转换并返回。
     - `AsyncRunnable` 子类应重写此方法以提供真正的异步检查逻辑。
 - `set_check(self, func: Union[Callable[[Any], bool], Callable[[Any], Coroutine[Any, Any, bool]]]) -> 'Runnable'`:
+- `map_inputs(self, **mappings) -> 'Runnable'`:
+    - 通过 `child.map_inputs(foo=parent.Output.bar, timeout=5)` 显式声明字段级数据传递与静态常量。
+    - `Output` 属性会返回 `_OutputFieldRef`，使得 IDE 智能感知字段名称且避免硬编码。
+    - 返回新的 `Runnable` 副本（保持不可变语义）。
 - **Pydantic 数据契约**：
     - 若声明 `InputModel`，`invoke`/`invoke_async` 会在 `_internal_invoke` 之前自动执行 `InputModel(**payload)` 并将模型实例传入；校验失败会抛出 `ValueError`。
     - 若声明 `OutputModel`，`_internal_invoke` 返回后会执行 `OutputModel.parse_obj(result)`，返回的就是模型实例。
@@ -324,7 +322,7 @@ classDiagram
 
 * `invoke_async(self, input_data: Any = NO_INPUT, context: Optional[ExecutionContext] = None) -> Coroutine[Any, Any, Any]`:
   * **原生异步执行** `AsyncRunnable` 的核心公共方法。
-  * 管理执行流程：创建或使用 `ExecutionContext`，解析输入数据 (基于 `input_data` 和 `input_declaration`，支持异步 `input_declaration` 函数)，检查缓存，执行异步重试逻辑，`await self._internal_invoke_async(...)`，处理错误 (错误处理器也通过 `invoke_async` 调用)，存储缓存和上下文输出。
+  * 管理执行流程：创建或使用 `ExecutionContext`，解析 `map_inputs`/静态常量声明的字段，检查缓存，执行异步重试逻辑，`await self._internal_invoke_async(...)`，处理错误 (错误处理器也通过 `invoke_async` 调用)，存储缓存和上下文输出。
   * 这是在异步代码中执行 `AsyncRunnable` 的 **推荐方式**。
 * `_internal_invoke_async(self, input_data: Any, context: ExecutionContext) -> Coroutine[Any, Any, Any]`: (抽象方法) **异步**子类必须实现此方法以定义其核心异步逻辑。
 * `check_async(self, data_from_invoke: Any, context: Optional[ExecutionContext] = None) -> Coroutine[Any, Any, bool]`:
@@ -355,8 +353,8 @@ classDiagram
 
 #### 同步实现 (`taskpipe.runnables`)
 
-* **`SimpleTask(Runnable)`**: 将普通函数包装成同步 `Runnable`。
-  * `__init__(self, func: Callable, name: Optional[str] = None, input_declaration: Any = None, **kwargs)`: `func` 是要执行的同步函数。
+* **`SimpleTask(Runnable)`**: 将普通函数包装成同步 `Runnable`，自动推断 `InputModel`/`OutputModel`。
+  * `__init__(self, func: Callable, name: Optional[str] = None, **kwargs)`
 * **`Pipeline(Runnable)`**: 按顺序同步执行两个 `Runnable`。
   * `__init__(self, first: Runnable, second: Runnable, name: Optional[str] = None, **kwargs)`
 * **`Conditional(Runnable)`**: 根据同步条件执行两个分支之一。
@@ -408,7 +406,7 @@ classDiagram
 
 * `name: str`: 图的名称。
 * `nodes: Dict[str, Runnable]`: 图中节点的字典 (存储的是 `Runnable` 的副本)。
-* `edges: Dict[str, List[Tuple[str, Optional[Callable]]]]`: 图中边的字典，定义依赖和可选的数据映射函数 (`input_mapper`)。
+* `edges: Dict[str, List[EdgeDefinition]]`: 图中边的字典，`EdgeDefinition` 包含 `data_mapping`、`static_inputs`、`branch` 等元数据。
 * `entry_points: List[str]`: 用户指定的图入口节点名称列表。如果未指定，则自动推断为入度为0的节点。
 * `output_node_names: List[str]`: 用户指定的图输出节点名称列表。如果未指定，则自动推断为出度为0的节点。
 
@@ -416,7 +414,7 @@ classDiagram
 
 * `__init__(self, name: Optional[str] = None)`: 构造函数。
 * `add_node(self, runnable: Runnable, node_name: Optional[str] = None) -> str`: 向图中添加一个节点。`runnable` 会被复制 (`runnable.copy()`) 后存储。节点名称必须唯一。
-* `add_edge(self, source_node_name: str, dest_node_name: str, input_mapper: Optional[Callable[[Any, Dict[str, Any]], Any]] = None)`: 添加一条从源节点到目标节点的边。`input_mapper` 是一个可选的同步函数，用于转换源节点的输出以匹配目标节点的输入格式；它接收源输出和当前上下文的 `node_outputs` 副本。
+* `add_edge(self, source_node_name: str, dest_node_name: str, data_mapping: Optional[Dict[str, str]] = None, static_inputs: Optional[Dict[str, Any]] = None, branch: Optional[str] = None)`: 添加一条从源节点到目标节点的边。`data_mapping` 描述字段拷贝关系，`static_inputs` 记录常量注入，`branch` 用于 Router 控制流。
 * `set_entry_point(self, node_name: str) -> 'WorkflowGraph'`: 设置图的一个入口节点。
 * `set_output_nodes(self, node_names: List[str]) -> 'WorkflowGraph'`: 设置图的输出节点列表。
 * `compile(self) -> 'CompiledGraph'`: 分析图结构（进行拓扑排序以检测循环并确定执行顺序），并返回一个可执行的 `CompiledGraph` 实例。
@@ -447,7 +445,7 @@ classDiagram
   * 创建一个内部的 `ExecutionContext` (其父级是传入的 `context`)。
   * 按 `execution_stages` 的顺序遍历节点（同步模式下仍是顺序执行）。
   * 对每个节点：
-    * 调用 `_prepare_node_input` 来确定该节点的输入（基于图的初始输入、父节点输出、`input_mapper` 或节点的 `input_declaration`）。
+    * 调用 `_prepare_node_input` 来根据 `data_mapping`/`static_inputs` 拼装下一节点的输入。
     * 调用节点的同步 `node.invoke(node_input, internal_graph_context)`。
   * 收集 `output_nodes` 的结果并返回。
   * **警告**：如果图中包含 `AsyncRunnable` 节点，并且 `CompiledGraph.invoke()` 是在一个已运行的 `asyncio` 事件循环中被调用的，那么这些 `AsyncRunnable` 节点的 `invoke()` (内部使用 `asyncio.run()`) 会导致 `RuntimeError`。
@@ -627,7 +625,7 @@ if __name__ == "__main__":
 
 **3. （可选）自定义 `check` 方法或 `_default_check` 方法，以提供自定义的检查逻辑。**
 
-**4. （可选）使用 `input_declaration` 声明输入，以便从 `ExecutionContext` 获取输入数据。**
+**4. （可选）通过 `map_inputs` 声明字段映射，以便在代码与 GUI 之间共享数据契约。**
 
 **5. （可选）自定义 `cache_key_generator`，以提供自定义的缓存键生成逻辑。**
 

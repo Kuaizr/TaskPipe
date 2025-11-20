@@ -2,29 +2,64 @@
   "name": "MetricIngestion",
   "nodes": [
     {
+      "id": "CollectMetrics",
       "name": "CollectMetrics",
       "ref": "CollectMetrics",
-      "type": "SimpleTask"
+      "type": "collect_metrics",
+      "input_schema": {},
+      "output_schema": {
+        "cpu": "float",
+        "ram": "float"
+      }
     },
     {
+      "id": "NormalizeMetrics",
       "name": "NormalizeMetrics",
       "ref": "NormalizeMetrics",
-      "type": "SimpleTask"
+      "type": "normalize_metrics",
+      "input_schema": {
+        "cpu": "float",
+        "ram": "float"
+      },
+      "output_schema": {
+        "cpu": "float",
+        "ram": "float"
+      }
     },
     {
+      "id": "PersistResult",
       "name": "PersistResult",
       "ref": "PersistResult",
-      "type": "SimpleTask"
+      "type": "persist_result",
+      "input_schema": {
+        "cpu": "float",
+        "ram": "float"
+      },
+      "output_schema": {
+        "text": "str"
+      }
     }
   ],
   "edges": [
     {
       "source": "CollectMetrics",
-      "dest": "NormalizeMetrics"
+      "dest": "NormalizeMetrics",
+      "data_mapping": {
+        "cpu": "cpu",
+        "ram": "ram"
+      },
+      "static_inputs": {},
+      "branch": null
     },
     {
       "source": "NormalizeMetrics",
-      "dest": "PersistResult"
+      "dest": "PersistResult",
+      "data_mapping": {
+        "cpu": "cpu",
+        "ram": "ram"
+      },
+      "static_inputs": {},
+      "branch": null
     }
   ],
   "entry_points": [

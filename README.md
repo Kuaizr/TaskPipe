@@ -4,7 +4,11 @@ TaskPipe 是一个 Python 框架，用于构建、组合和执行复杂的工作
 
 ## 核心特性
 
-* **可组合的 `Runnable` 任务**: 将工作流的每一步定义为 `Runnable` 的子类。框架提供了 `Runnable` (同步基类) 和 `AsyncRunnable` (异步基类)，以及多种预构建的 `Runnable` 类型，如 `SimpleTask`、`Pipeline`、`Conditional`、`BranchAndFanIn`、`SourceParallel` 及其对应的异步版本。
+* **可组合的 `Runnable` 任务**: 将工作流的每一步定义为 `Runnable`/`AsyncRunnable`。可以用传统继承方式，也可以通过 `@task` 装饰器把普通函数“抬升”为带 Pydantic 校验的任务。常用组合器包括 `SimpleTask`、`Pipeline`、`Conditional`、`BranchAndFanIn`、`SourceParallel` 及其异步版本。
+* **显式数据映射 (`map_inputs`)**：
+    * 所有 `Runnable` 都通过 `InputModel` / `OutputModel` 声明结构化 Schema。
+    * `child.map_inputs(foo=parent.Output.bar, timeout=3)` 可以精准描述数据流以及常量注入，便于 GUI/JSON 序列化。
+    * `WorkflowGraph` 与 `CompiledGraph` 会读取这些映射，自动生成 `data_mapping`/`static_inputs` 并在运行时做字段级传递。
 * **同步与异步的无缝集成**:
     * 可以自由地在工作流中混合使用同步 (`Runnable`) 和异步 (`AsyncRunnable`) 任务。
     * 当组合中包含任何异步任务时，整个工作流通常会自动升级为异步工作流 (例如，`AsyncPipeline`, `AsyncConditional`)，以确保非阻塞执行。
@@ -25,7 +29,7 @@ TaskPipe 是一个 Python 框架，用于构建、组合和执行复杂的工作
 * **生命周期钩子**:
     * 新增 `on_start` 和 `on_complete` 生命周期钩子，允许用户在任务执行的关键阶段（开始前和完成后）注入自定义逻辑。
     * 这些钩子（包括增强后的 `on_error`）都可以接受 `Runnable` 实例或普通可调用函数作为处理器，为日志记录、资源管理、监控和通知等场景提供了极大的灵活性。
-* **基于图的定义 (可选)**: 对于更复杂或需要集中管理的工作流，可以使用 `WorkflowGraph` 以声明方式定义节点和边，然后将其编译为可执行的 `CompiledGraph`。`CompiledGraph` 同样支持同步和异步执行，并且在异步执行时会按照自动计算的“执行阶段”并发运行同一阶段中互不依赖的节点。
+* **基于图的定义 (可选)**: `WorkflowGraph` 中的边保存 `data_mapping` / `static_inputs` / `branch`，`CompiledGraph` 在运行时根据这些配置精准拼装输入，并提供 Router 分支激活、跳过等控制流能力。
 * **RunnableRegistry**： taskpipe 内置轻量级注册表，应用层可以集中注册可用的 `Runnable`，`WorkflowGraph.from_json` 可以直接使用该注册表来反序列化节点。
 * **图 ↔ 代码 双向转换**: 任意 `Runnable`（例如通过 `|` 操作符构建的“PyTorch 风格”流水线）都可以调用 `.to_graph()` 导出为 `WorkflowGraph`，而 `WorkflowGraph.from_json()` / `WorkflowGraph.to_json()` 允许平台化场景进行持久化、可视化与低代码集成。示例脚本会将导出的 JSON 保存到 `examples/registry_workflow.json`，便于直接加载或上传。
 * **可扩展性**: 用户可以轻松创建自己的、继承自 `Runnable` 或 `AsyncRunnable` 的自定义任务类型，以封装特定的业务逻辑。
@@ -48,7 +52,9 @@ TaskPipe 是一个 Python 框架，用于构建、组合和执行复杂的工作
 │   ├── test\_async\_runnables.py
 │   └── test\_graph.py
 ├── examples/               \# 使用示例
-│   └── test.py             \# (或其他示例文件)
+│   ├── pipeline_with_schema.py
+│   ├── parallel_report_workflow.py
+│   └── registry_serialization.py
 ├── setup.py                \# 项目安装配置
 └── README.md               \# 本文件
 
@@ -64,11 +70,11 @@ pip install -e .
 
 这将把 `taskpipe` 包链接到你的 Python 环境中，使其可以像其他已安装的库一样被导入，同时你对源代码的任何修改都会立即生效。
 
-## Pydantic Schema 示例
+## Pydantic Schema / `@task` 示例
 
 ```python
 from pydantic import BaseModel
-from taskpipe import Runnable
+from taskpipe import Runnable, task
 
 class EmailInput(BaseModel):
     subject: str
@@ -86,13 +92,16 @@ class SendEmail(Runnable):
     ConfigModel = EmailConfig
 
     def _internal_invoke(self, input_data: EmailInput, context):
-        # input_data 已经是 Pydantic 对象
         ...  # 实际发送邮件
         return {"status": "sent"}
 
-task = SendEmail(config={"smtp_server": "smtp.example.com"})
-result = task.invoke({"subject": "Hi", "body": "..."})
-assert result.status == "sent"
+@task
+def format_status(email: EmailOutput) -> {"text": str}:
+    return {"text": f"STATUS: {email.status}"}
+
+mailer = SendEmail(config={"smtp_server": "smtp.example.com"})
+result = mailer | format_status
+print(result.invoke({"subject": "Hi", "body": "..."}).text)
 ```
 
 ## 示例 (`examples/` 目录)

@@ -281,8 +281,22 @@ class Runnable(abc.ABC):
         if direct_input is NO_INPUT or direct_input is None:
             return {}
         if isinstance(direct_input, BaseModel):
-            return direct_input.model_dump()
+            # 如果是 Pydantic 模型，转换为字典
+            input_dict = direct_input.model_dump()
+            # 如果当前任务的 InputModel 只有一个字段，且输入模型也只有一个字段，尝试自动映射
+            input_fields = list(getattr(self._input_model_cls, "model_fields", {}).keys())
+            if len(input_fields) == 1 and len(input_dict) == 1:
+                # 单字段自动映射：将输入的值映射到目标字段
+                input_value = list(input_dict.values())[0]
+                return {input_fields[0]: input_value}
+            return input_dict
         if isinstance(direct_input, dict):
+            # 如果输入是字典，且当前任务的 InputModel 只有一个字段，尝试自动映射
+            input_fields = list(getattr(self._input_model_cls, "model_fields", {}).keys())
+            if len(input_fields) == 1 and len(direct_input) == 1:
+                # 单字段自动映射：将输入的值映射到目标字段
+                input_value = list(direct_input.values())[0]
+                return {input_fields[0]: input_value}
             return dict(direct_input)
         model_fields = list(getattr(self._input_model_cls, "model_fields", {}).keys())
         if len(model_fields) == 1:
@@ -407,7 +421,7 @@ class Runnable(abc.ABC):
                 return payload
             if isinstance(payload, dict):
                 return input_model_cls(**payload)
-            return input_model_cls.parse_obj(payload)
+            return input_model_cls.model_validate(payload)
         except ValidationError as exc:
             raise ValueError(f"Runnable '{self.name}' input validation failed: {exc}") from exc
 
@@ -415,12 +429,22 @@ class Runnable(abc.ABC):
         output_model_cls = getattr(self, "OutputModel", None)
         if output_model_cls is None:
             return result
+        
+        # 对于 Conditional 和 AsyncConditional，如果结果已经是 BaseModel 且字段兼容，直接返回
+        # 这样可以避免类型不匹配的问题（true_r 和 false_r 可能有不同的模型类型但字段相同）
+        from .async_runnables import AsyncConditional
+        if (isinstance(self, (Conditional, AsyncConditional)) and isinstance(result, BaseModel)):
+            result_fields = set(getattr(type(result), "model_fields", {}).keys())
+            expected_fields = set(getattr(output_model_cls, "model_fields", {}).keys())
+            if result_fields == expected_fields:
+                return result
+        
         try:
             if isinstance(result, output_model_cls):
                 return result
             if isinstance(result, dict):
                 return output_model_cls(**result)
-            return output_model_cls.parse_obj(result)
+            return output_model_cls.model_validate(result)
         except ValidationError as exc:
             raise ValueError(f"Runnable '{self.name}' output validation failed: {exc}") from exc
 
@@ -509,7 +533,13 @@ class Runnable(abc.ABC):
                                     elif callable(self._error_handler): 
                                         error_handler_output = self._error_handler(effective_context, prepared_input_for_invoke, e_internal)
                                     
-                                    task_final_result = self._apply_output_model(error_handler_output)
+                                    # 错误处理器的输出可能使用不同的模型，尝试应用输出模型，如果失败则直接使用
+                                    try:
+                                        task_final_result = self._apply_output_model(error_handler_output)
+                                    except (ValueError, ValidationError):
+                                        # 如果错误处理器的输出模型不匹配，直接使用原始输出
+                                        effective_context.log_event(f"Node '{self.name}': Error handler output model mismatch, using raw output.")
+                                        task_final_result = error_handler_output
                                     task_final_exception = None 
                                     
                                     if self.use_cache and cache_key is not None: # <<< MODIFIED: Check use_cache
@@ -639,13 +669,23 @@ class Runnable(abc.ABC):
         return self
 
     def __or__(self, other: Union['Runnable', Dict[str, 'Runnable']]) -> 'Runnable':
-        # This version of __or__ will always create a synchronous Pipeline/BranchAndFanIn.
-        # AsyncRunnable will override __or__ and __ror__ to create AsyncPipeline.
+        # Check if other is AsyncRunnable - if so, create AsyncPipeline
+        from .async_runnables import AsyncRunnable, AsyncPipeline
         if isinstance(other, Runnable):
+            # If either self or other is AsyncRunnable, use AsyncPipeline
+            if isinstance(self, AsyncRunnable) or isinstance(other, AsyncRunnable):
+                return AsyncPipeline(self, other, name=f"({self.name} | {other.name})")
             return Pipeline(self, other, name=f"({self.name} | {other.name})")
         elif isinstance(other, dict) and all(isinstance(r, Runnable) for r in other.values()):
-            branch_fan_in = BranchAndFanIn(other, name=f"BranchFanIn_after_{self.name}")
-            return Pipeline(self, branch_fan_in, name=f"({self.name} | {branch_fan_in.name})")
+            # Check if any runnable in dict is AsyncRunnable
+            has_async = isinstance(self, AsyncRunnable) or any(isinstance(r, AsyncRunnable) for r in other.values())
+            if has_async:
+                from .async_runnables import AsyncBranchAndFanIn
+                branch_fan_in = AsyncBranchAndFanIn(other, name=f"BranchFanIn_after_{self.name}")
+                return AsyncPipeline(self, branch_fan_in, name=f"({self.name} | {branch_fan_in.name})")
+            else:
+                branch_fan_in = BranchAndFanIn(other, name=f"BranchFanIn_after_{self.name}")
+                return Pipeline(self, branch_fan_in, name=f"({self.name} | {branch_fan_in.name})")
         return NotImplemented
 
     def __mod__(self, true_branch: 'Runnable') -> '_PendingConditional':
@@ -827,6 +867,9 @@ class Pipeline(Runnable):
 
     def _internal_invoke(self, input_data: Any, context: ExecutionContext) -> Any:
         output_first = self.first.invoke(input_data, context)
+        # Pipeline 中，second 应该接收 first 的输出
+        # 如果 second 有 map_inputs 配置，会通过 context 自动处理
+        # 否则，直接传递 output_first，让 second 的 _prepare_input_payload 处理
         output_second = self.second.invoke(output_first, context)
         return output_second
 
@@ -849,19 +892,32 @@ class _CheckAdapterRunnable(Runnable):
     Used during graph expansion for Conditional nodes.
     """
     def __init__(self, target_runnable: Runnable, name: Optional[str] = None):
-        super().__init__(name=name or f"{target_runnable.name}_CheckAdapter")
         self.target = target_runnable
+        adapter_name = name or f"{target_runnable.name}_CheckAdapter"
         # Inherit InputModel from target's OutputModel to maintain graph continuity visual semantics
         # This allows the graph visualizer to see matching types.
-        self.InputModel = target_runnable._output_model_cls
+        # Must set as class attribute before calling super().__init__()
+        self.__class__.InputModel = target_runnable._output_model_cls
         # Explicit OutputModel for Router compatibility
-        self.OutputModel = create_model(f"{self.name}Output", condition=(bool, ...))
+        self.__class__.OutputModel = create_model(f"{adapter_name}Output", condition=(bool, ...))
+        super().__init__(name=adapter_name)
 
     def _internal_invoke(self, input_data: Any, context: ExecutionContext) -> Dict[str, bool]:
         # input_data here is already processed by _apply_input_model.
         # If self.InputModel matches target's OutputModel, input_data is a valid result from target.
         # We pass this result to target.check()
-        result = self.target.check(input_data, context)
+        # Extract the actual value from the model if it's a BaseModel
+        if isinstance(input_data, BaseModel):
+            # If the model has a single field, extract it; otherwise pass the model
+            model_cls = type(input_data)
+            fields = list(model_cls.model_fields.keys())
+            if len(fields) == 1:
+                check_value = getattr(input_data, fields[0])
+            else:
+                check_value = input_data
+        else:
+            check_value = input_data
+        result = self.target.check(check_value, context)
         return {"condition": result}
 
 
@@ -887,12 +943,18 @@ class Conditional(Runnable):
                 f"Conditional '{self.name}' detected async check logic on '{self.condition_r.name}'. "
                 "Use AsyncConditional to evaluate asynchronous checks."
             )
+        # Conditional 中，分支任务应该接收 condition_r 的输出
+        # 直接传递 condition_output，让分支任务的 _prepare_input_payload 处理
         if self.condition_r.check(condition_output, context): 
             context.log_event(f"Node '{self.name}': Condition TRUE, executing '{self.true_r.name}'.")
-            return self.true_r.invoke(condition_output, context)
+            branch_output = self.true_r.invoke(condition_output, context)
         else:
             context.log_event(f"Node '{self.name}': Condition FALSE, executing '{self.false_r.name}'.")
-            return self.false_r.invoke(condition_output, context)
+            branch_output = self.false_r.invoke(condition_output, context)
+        
+        # Conditional 的输出应该直接返回分支的输出，不进行额外的模型验证
+        # 因为我们已经验证了两个分支的 OutputModel 字段兼容
+        return branch_output
 
     def _expand_to_graph(self, graph: 'WorkflowGraph', helper: '_GraphExportHelper') -> Tuple[List[str], List[str]]:
         # 1. Expand Condition node (A)
@@ -1091,9 +1153,20 @@ class While(Runnable):
             
             context.log_event(f"Node '{self.name}': Loop {loop_count + 1}, Condition TRUE, executing body '{self.body_runnable.name}'. Body input type: {type(current_input_for_iteration).__name__}")
             
+            # 提取 current_input_for_iteration 的实际值
+            if isinstance(current_input_for_iteration, BaseModel):
+                model_cls = type(current_input_for_iteration)
+                fields = list(model_cls.model_fields.keys())
+                if len(fields) == 1:
+                    last_value = getattr(current_input_for_iteration, fields[0])
+                else:
+                    last_value = self._unwrap_input_payload(current_input_for_iteration)
+            else:
+                last_value = self._unwrap_input_payload(current_input_for_iteration)
+            
             history_snapshot = [self._unwrap_input_payload(item) for item in all_body_outputs]
             loop_input_payload = {
-                "last": self._unwrap_input_payload(current_input_for_iteration),
+                "last": last_value,
                 "history": history_snapshot,
                 "iteration": loop_count,
             }
@@ -1223,8 +1296,8 @@ class _GraphExportHelper:
             self._static_attached.add(node_name)
 
     def _infer_auto_mapping(self, parent: Runnable, child: Runnable) -> Dict[str, str]:
-        parent_fields = list(parent._output_model_cls.__fields__.keys())
-        child_fields = list(child._input_model_cls.__fields__.keys())
+        parent_fields = list(parent._output_model_cls.model_fields.keys())
+        child_fields = list(child._input_model_cls.model_fields.keys())
         if len(parent_fields) == 1 and len(child_fields) == 1:
             parent_schema = parent.describe_output_schema()
             child_schema = child.describe_input_schema()

@@ -104,11 +104,15 @@ class AsyncRunnable(Runnable):
                                 effective_context.log_event(
                                     f"Node '{self.name}': Async error handler "
                                     f"'{getattr(self._error_handler, 'name', 'UnnamedErrorHandler')}' executed.")
+                                # 错误处理器的输出可能使用不同的模型，尝试应用输出模型，如果失败则直接使用
+                                try:
+                                    adjusted_output = self._apply_output_model(error_handler_output)
+                                except (ValueError, ValidationError):
+                                    # 如果错误处理器的输出模型不匹配，直接使用原始输出
+                                    effective_context.log_event(f"Node '{self.name}': Error handler output model mismatch, using raw output.")
+                                    adjusted_output = error_handler_output
                                 if self.name:
-                                    adjusted_output = self._apply_output_model(error_handler_output)
                                     effective_context.add_output(self.name, adjusted_output)
-                                else:
-                                    adjusted_output = self._apply_output_model(error_handler_output)
                                 if self.use_cache and cache_key is not None: # <<< MODIFIED: Check use_cache
                                     self._invoke_cache[cache_key] = adjusted_output
                                 self._emit_node_status(effective_context, "success")
@@ -146,7 +150,11 @@ class AsyncRunnable(Runnable):
             if context: context.log_event(f"Node '{self.name}': Async check caching disabled (use_cache=False).")
             if self._custom_async_check_fn:
                 return await self._custom_async_check_fn(data_from_invoke)
-            # If no custom_async_check_fn, use default async check logic
+            # If there's a sync custom_check_fn, use it via run_in_executor
+            if self._custom_check_fn:
+                loop = asyncio.get_event_loop()
+                return await loop.run_in_executor(None, self.check, data_from_invoke, context)
+            # If no custom check function, use default async check logic
             return await self._default_check_async(data_from_invoke)
 
         cache_key_data = data_from_invoke
@@ -163,7 +171,11 @@ class AsyncRunnable(Runnable):
         result: bool
         if self._custom_async_check_fn:
             result = await self._custom_async_check_fn(data_from_invoke)
-        else: # No custom_async_check_fn, use default async
+        elif self._custom_check_fn:
+            # Use sync check function via run_in_executor
+            loop = asyncio.get_event_loop()
+            result = await loop.run_in_executor(None, self.check, data_from_invoke, context)
+        else: # No custom check function, use default async
             result = await self._default_check_async(data_from_invoke)
 
         # self._check_cache is written to only if self.use_cache was True (due to initial check)
@@ -258,6 +270,9 @@ class AsyncPipeline(AsyncRunnable):
         context.log_event(f"Node '{self.name}': First task '{self.first.name}' starting.")
         output_first = await self.first.invoke_async(input_data, context)
         context.log_event(f"Node '{self.name}': First task '{self.first.name}' completed. Second task '{self.second.name}' starting.")
+        # Pipeline 中，second 应该接收 first 的输出
+        # 如果 second 有 map_inputs 配置，会通过 context 自动处理
+        # 否则，直接传递 output_first，让 second 的 _prepare_input_payload 处理
         output_second = await self.second.invoke_async(output_first, context)
         context.log_event(f"Node '{self.name}': Second task '{self.second.name}' completed.")
         return output_second
@@ -281,16 +296,30 @@ class _AsyncCheckAdapterRunnable(AsyncRunnable):
     Used during graph expansion for AsyncConditional nodes.
     """
     def __init__(self, target_runnable: Runnable, name: Optional[str] = None):
-        super().__init__(name=name or f"{target_runnable.name}_CheckAdapter")
         self.target = target_runnable
+        adapter_name = name or f"{target_runnable.name}_CheckAdapter"
         # Inherit InputModel from target's OutputModel for visual continuity
-        self.InputModel = target_runnable._output_model_cls
+        # Must set as class attribute before calling super().__init__()
+        self.__class__.InputModel = target_runnable._output_model_cls
         # Explicit OutputModel for Router compatibility
-        self.OutputModel = create_model(f"{self.name}Output", condition=(bool, ...))
+        self.__class__.OutputModel = create_model(f"{adapter_name}Output", condition=(bool, ...))
+        super().__init__(name=adapter_name)
 
     async def _internal_invoke_async(self, input_data: Any, context: ExecutionContext) -> Dict[str, bool]:
+        # Extract the actual value from the model if it's a BaseModel
+        from pydantic import BaseModel
+        if isinstance(input_data, BaseModel):
+            # If the model has a single field, extract it; otherwise pass the model
+            model_cls = type(input_data)
+            fields = list(model_cls.model_fields.keys())
+            if len(fields) == 1:
+                check_value = getattr(input_data, fields[0])
+            else:
+                check_value = input_data
+        else:
+            check_value = input_data
         # Call the async check method
-        result = await self.target.check_async(input_data, context)
+        result = await self.target.check_async(check_value, context)
         return {"condition": result}
 
 
@@ -312,12 +341,18 @@ class AsyncConditional(AsyncRunnable):
         condition_output = await self.condition_r.invoke_async(input_data, context)
         
         context.log_event(f"Node '{self.name}': Checking condition output.")
+        # AsyncConditional 中，分支任务应该接收 condition_r 的输出
+        # 直接传递 condition_output，让分支任务的 _prepare_input_payload 处理
         if await self.condition_r.check_async(condition_output, context):
             context.log_event(f"Node '{self.name}': Condition TRUE, executing true_branch '{self.true_r.name}'.")
-            return await self.true_r.invoke_async(condition_output, context)
+            branch_output = await self.true_r.invoke_async(condition_output, context)
         else:
             context.log_event(f"Node '{self.name}': Condition FALSE, executing false_branch '{self.false_r.name}'.")
-            return await self.false_r.invoke_async(condition_output, context)
+            branch_output = await self.false_r.invoke_async(condition_output, context)
+        
+        # AsyncConditional 的输出应该直接返回分支的输出，不进行额外的模型验证
+        # 因为我们已经验证了两个分支的 OutputModel 字段兼容
+        return branch_output
 
     def _expand_to_graph(self, graph: 'WorkflowGraph', helper: '_GraphExportHelper') -> Tuple[List[str], List[str]]:
         # 1. Expand Condition node (A)
@@ -385,9 +420,22 @@ class AsyncWhile(AsyncRunnable):
                 break
             
             context.log_event(f"Node '{self.name}': Condition TRUE. Executing body '{self.body_runnable.name}'.")
+            
+            # 提取 current_input_for_iteration 的实际值
+            from pydantic import BaseModel
+            if isinstance(current_input_for_iteration, BaseModel):
+                model_cls = type(current_input_for_iteration)
+                fields = list(model_cls.model_fields.keys())
+                if len(fields) == 1:
+                    last_value = getattr(current_input_for_iteration, fields[0])
+                else:
+                    last_value = self._unwrap_input_payload(current_input_for_iteration)
+            else:
+                last_value = self._unwrap_input_payload(current_input_for_iteration)
+            
             history_snapshot = [self._unwrap_input_payload(item) for item in all_body_outputs]
             loop_input_payload = {
-                "last": self._unwrap_input_payload(current_input_for_iteration),
+                "last": last_value,
                 "history": history_snapshot,
                 "iteration": loop_count,
             }

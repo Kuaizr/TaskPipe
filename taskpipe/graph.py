@@ -567,14 +567,30 @@ class CompiledGraph(Runnable):
         final_results: Dict[str, Any] = {}
         for out_name in self.output_nodes:
             if out_name in internal_graph_context.node_outputs:
-                final_results[out_name] = internal_graph_context.get_output(out_name)
+                value = internal_graph_context.get_output(out_name)
+                # If value is a Pydantic model with a single field, extract the field value
+                from pydantic import BaseModel
+                if isinstance(value, BaseModel):
+                    model_cls = type(value)
+                    fields = list(model_cls.model_fields.keys())
+                    if len(fields) == 1:
+                        final_results[out_name] = getattr(value, fields[0])
+                    else:
+                        final_results[out_name] = value
+                else:
+                    final_results[out_name] = value
             else:
                 final_results[out_name] = None 
 
         internal_graph_context.log_event(f"Graph '{self.name}': Execution finished. Returning outputs for: {list(final_results.keys())}.")
         
-        if len(final_results) == 1:
-            return list(final_results.values())[0]
+        # Filter out None values (e.g., from skipped branches)
+        non_none_results = {k: v for k, v in final_results.items() if v is not None}
+        
+        if len(non_none_results) == 1:
+            return list(non_none_results.values())[0]
+        elif len(non_none_results) == 0:
+            return None
         return final_results
 
     # To make CompiledGraph fully act like an AsyncRunnable, it would also need invoke_async at the top level

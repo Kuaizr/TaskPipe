@@ -5,7 +5,7 @@ from typing import Any, Callable, Optional, Dict, List, Tuple, Set, Union
 from collections import deque
 
 # Assuming runnables.py is in the same directory or accessible via PYTHONPATH
-from .runnables import Runnable, ExecutionContext, InMemoryExecutionContext, NO_INPUT, SimpleTask, BaseModel
+from .runnables import Runnable, ExecutionContext, InMemoryExecutionContext, NO_INPUT, BaseModel
 # To allow CompiledGraph to be an AsyncRunnable if desired, or to call invoke_async
 from .async_runnables import AsyncRunnable 
 from .registry import RunnableRegistry

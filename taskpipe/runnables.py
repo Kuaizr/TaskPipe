@@ -732,6 +732,7 @@ def _build_output_model_from_callable(func: Callable, task_name: str) -> Type[Ba
 def task(func: Optional[Callable] = None, *, name: Optional[str] = None):
     """
     将普通函数转换为带强类型契约的 Runnable 子类。
+    支持同步函数 (生成 Runnable) 和异步函数 (生成 AsyncRunnable)。
     """
 
     def decorator(callable_obj: Callable) -> Type[Runnable]:
@@ -744,7 +745,18 @@ def task(func: Optional[Callable] = None, *, name: Optional[str] = None):
         signature = inspect.signature(callable_obj)
         expects_context = "context" in signature.parameters
 
-        class GeneratedTask(Runnable):
+        # 检测是否为异步函数
+        is_async = inspect.iscoroutinefunction(callable_obj)
+
+        # 动态选择基类
+        if is_async:
+            # 局部导入以避免循环依赖 (runnables <-> async_runnables)
+            from .async_runnables import AsyncRunnable
+            BaseClass = AsyncRunnable
+        else:
+            BaseClass = Runnable
+
+        class GeneratedTask(BaseClass):
             InputModel = input_model
             OutputModel = output_model
 
@@ -752,11 +764,15 @@ def task(func: Optional[Callable] = None, *, name: Optional[str] = None):
                 runtime_name = kwargs.pop("name", task_name)
                 super().__init__(name=runtime_name, **kwargs)
 
-            def _internal_invoke(self, input_data: Any, context: ExecutionContext) -> Any:
+            def _prepare_payload(self, input_data: Any, context: ExecutionContext) -> dict:
+                """辅助方法：准备调用参数"""
                 payload = input_data.model_dump() if isinstance(input_data, BaseModel) else dict(input_data or {})
                 if expects_context:
                     payload["context"] = context
-                result = callable_obj(**payload)
+                return payload
+
+            def _process_result(self, result: Any) -> Any:
+                """辅助方法：处理返回值"""
                 if isinstance(result, BaseModel):
                     return result
                 if isinstance(result, dict):
@@ -766,6 +782,18 @@ def task(func: Optional[Callable] = None, *, name: Optional[str] = None):
                     return {output_fields[0]: result}
                 return result
 
+            # 根据是否为异步函数，有条件地定义执行方法
+            if is_async:
+                async def _internal_invoke_async(self, input_data: Any, context: ExecutionContext) -> Any:
+                    payload = self._prepare_payload(input_data, context)
+                    result = await callable_obj(**payload)
+                    return self._process_result(result)
+            else:
+                def _internal_invoke(self, input_data: Any, context: ExecutionContext) -> Any:
+                    payload = self._prepare_payload(input_data, context)
+                    result = callable_obj(**payload)
+                    return self._process_result(result)
+
         GeneratedTask.__name__ = task_name
         GeneratedTask.__doc__ = getattr(callable_obj, "__doc__", None)
         GeneratedTask.__module__ = callable_obj.__module__
@@ -774,33 +802,6 @@ def task(func: Optional[Callable] = None, *, name: Optional[str] = None):
     if func is not None:
         return decorator(func)
     return decorator
-
-
-class SimpleTask(Runnable):
-    def __init__(self, func: Callable, name: Optional[str] = None, **kwargs):
-        if not callable(func):
-            raise TypeError("SimpleTask requires a callable.")
-        self._callable = func
-        self._signature = inspect.signature(func)
-        self._expects_context = "context" in self._signature.parameters
-        task_name = name or getattr(func, "__name__", None) or "SimpleTask"
-        self.InputModel = _build_input_model_from_callable(func, task_name)
-        self.OutputModel = _build_output_model_from_callable(func, task_name)
-        super().__init__(task_name, **kwargs)
-
-    def _internal_invoke(self, input_data: Any, context: ExecutionContext) -> Any:
-        payload = input_data.model_dump() if isinstance(input_data, BaseModel) else dict(input_data or {})
-        if self._expects_context:
-            payload.setdefault("context", context)
-        result = self._callable(**payload)
-        if isinstance(result, BaseModel):
-            return result
-        if isinstance(result, dict):
-            return result
-        output_fields = list(getattr(self.OutputModel, "model_fields", {}).keys())
-        if len(output_fields) == 1:
-            return {output_fields[0]: result}
-        return result
 
 
 class Pipeline(Runnable):

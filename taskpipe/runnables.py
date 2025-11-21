@@ -48,6 +48,8 @@ class ExecutionContext(Protocol):
 
     def get_output(self, node_name: str, default: Any = None) -> Any: ...
 
+    def remove_output(self, node_name: str) -> None: ...
+
     def log_event(self, message: str) -> None: ...
 
 
@@ -75,6 +77,13 @@ class InMemoryExecutionContext:
         if self.parent_context:
             return self.parent_context.get_output(node_name, default)
         return default
+
+    def remove_output(self, node_name: str) -> None:
+        """从上下文中移除指定节点的输出（用于垃圾回收）。"""
+        if node_name in self.node_outputs:
+            del self.node_outputs[node_name]
+            # 可选：记录调试日志，这里暂时注释掉以保持日志清洁
+            # logger.debug(f"GC: Output for node '{node_name}' removed from context.")
 
     def log_event(self, message: str):
         timestamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
@@ -833,6 +842,29 @@ class Pipeline(Runnable):
         return entry_first, exit_second
 
 
+class _CheckAdapterRunnable(Runnable):
+    """
+    Auto-generated adapter task that executes a Runnable's check() method
+    and returns a result compatible with a Router ({"condition": bool}).
+    Used during graph expansion for Conditional nodes.
+    """
+    def __init__(self, target_runnable: Runnable, name: Optional[str] = None):
+        super().__init__(name=name or f"{target_runnable.name}_CheckAdapter")
+        self.target = target_runnable
+        # Inherit InputModel from target's OutputModel to maintain graph continuity visual semantics
+        # This allows the graph visualizer to see matching types.
+        self.InputModel = target_runnable._output_model_cls
+        # Explicit OutputModel for Router compatibility
+        self.OutputModel = create_model(f"{self.name}Output", condition=(bool, ...))
+
+    def _internal_invoke(self, input_data: Any, context: ExecutionContext) -> Dict[str, bool]:
+        # input_data here is already processed by _apply_input_model.
+        # If self.InputModel matches target's OutputModel, input_data is a valid result from target.
+        # We pass this result to target.check()
+        result = self.target.check(input_data, context)
+        return {"condition": result}
+
+
 class Conditional(Runnable):
     def __init__(self, condition_r: Runnable, true_r: Runnable, false_r: Runnable, name: Optional[str] = None, **kwargs):
         self.condition_r = condition_r
@@ -862,6 +894,49 @@ class Conditional(Runnable):
             context.log_event(f"Node '{self.name}': Condition FALSE, executing '{self.false_r.name}'.")
             return self.false_r.invoke(condition_output, context)
 
+    def _expand_to_graph(self, graph: 'WorkflowGraph', helper: '_GraphExportHelper') -> Tuple[List[str], List[str]]:
+        # 1. Expand Condition node (A)
+        entry_cond, exit_cond = self.condition_r._expand_to_graph(graph, helper)
+
+        # 2. Create CheckAdapter node
+        # This adapter runs condition_r.check() and outputs {"condition": bool} for the Router
+        check_adapter = _CheckAdapterRunnable(self.condition_r)
+        adapter_node_name = helper.add_node(graph, check_adapter)
+
+        # Connect A -> Adapter
+        for parent in exit_cond:
+            helper.connect_by_name(graph, parent, adapter_node_name)
+
+        # 3. Create Router node
+        # Ensure Router is available. It is defined later in this file, but at runtime (when to_graph is called), it will be defined.
+        # Using a string lookup or deferred import might be safer if Router definition moves, but Router is a core Runnable.
+        # Assuming Router is available in the module scope.
+        router = Router(name=f"{self.condition_r.name}_Router")
+        router_node_name = helper.add_node(graph, router)
+
+        # Connect Adapter -> Router
+        helper.connect_by_name(graph, adapter_node_name, router_node_name)
+
+        # 4. Expand True/False branches
+        entry_true, exit_true = self.true_r._expand_to_graph(graph, helper)
+        entry_false, exit_false = self.false_r._expand_to_graph(graph, helper)
+
+        # 5. Connect Router -> Branches (Control Flow)
+        for child in entry_true:
+            helper.connect_by_name(graph, router_node_name, child, branch="true")
+        for child in entry_false:
+            helper.connect_by_name(graph, router_node_name, child, branch="false")
+
+        # 6. Connect A -> Branches (Data Bypass)
+        # Allows branches to receive original data from A, bypassing the Router/CheckAdapter
+        for parent in exit_cond:
+            for child in entry_true:
+                helper.connect_by_name(graph, parent, child)
+            for child in entry_false:
+                helper.connect_by_name(graph, parent, child)
+
+        # Return entry points (A's entries) and exit points (union of True/False exits)
+        return entry_cond, exit_true + exit_false
 
 class BranchAndFanIn(Runnable):
     def __init__(self, tasks_dict: Dict[str, Runnable], name: Optional[str] = None, max_workers: Optional[int] = None, **kwargs):
@@ -1155,5 +1230,4 @@ class _GraphExportHelper:
             child_schema = child.describe_input_schema()
             if parent_schema.get(parent_fields[0]) == child_schema.get(child_fields[0]):
                 return {child_fields[0]: parent_fields[0]}
-        return {"*": "*"}
         return {"*": "*"}

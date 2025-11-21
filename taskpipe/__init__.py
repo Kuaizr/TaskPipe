@@ -6,7 +6,6 @@ from .runnables import (
     ExecutionContext,
     InMemoryExecutionContext,
     Runnable,
-    SimpleTask,
     Pipeline,
     Conditional,
     BranchAndFanIn,
@@ -43,7 +42,7 @@ __all__ = [
     # Runnable base and ExecutionContext
     'ExecutionContext', 'InMemoryExecutionContext', 'Runnable', 'NO_INPUT',
     # Sync Runnables
-    'SimpleTask', 'Pipeline', 'Conditional', 'BranchAndFanIn',
+    'Pipeline', 'Conditional', 'BranchAndFanIn',
     'SourceParallel', 'While', 'MergeInputs', 'Router', 'ScriptRunnable', 'task',
     # AsyncRunnable base
     'AsyncRunnable',

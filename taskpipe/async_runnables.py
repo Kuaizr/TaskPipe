@@ -14,7 +14,10 @@ from .runnables import (
     BranchAndFanIn as SyncBranchAndFanIn,
     Conditional as SyncConditional,
     While as SyncWhile,
-    _PendingConditional as _SyncPendingConditional
+    _PendingConditional as _SyncPendingConditional,
+    # 新增导入
+    Router,
+    _GraphExportHelper
 )
 from pydantic import BaseModel, create_model
 
@@ -271,6 +274,25 @@ class AsyncPipeline(AsyncRunnable):
                 helper.connect_by_name(graph, parent, child)
         return entry_first, exit_second
 
+class _AsyncCheckAdapterRunnable(AsyncRunnable):
+    """
+    Auto-generated adapter task for AsyncRunnable that executes check_async()
+    and returns a result compatible with a Router ({"condition": bool}).
+    Used during graph expansion for AsyncConditional nodes.
+    """
+    def __init__(self, target_runnable: Runnable, name: Optional[str] = None):
+        super().__init__(name=name or f"{target_runnable.name}_CheckAdapter")
+        self.target = target_runnable
+        # Inherit InputModel from target's OutputModel for visual continuity
+        self.InputModel = target_runnable._output_model_cls
+        # Explicit OutputModel for Router compatibility
+        self.OutputModel = create_model(f"{self.name}Output", condition=(bool, ...))
+
+    async def _internal_invoke_async(self, input_data: Any, context: ExecutionContext) -> Dict[str, bool]:
+        # Call the async check method
+        result = await self.target.check_async(input_data, context)
+        return {"condition": result}
+
 
 class AsyncConditional(AsyncRunnable):
     def __init__(self, condition_r: Runnable, true_r: Runnable, false_r: Runnable, name: Optional[str] = None, **kwargs):
@@ -297,6 +319,44 @@ class AsyncConditional(AsyncRunnable):
             context.log_event(f"Node '{self.name}': Condition FALSE, executing false_branch '{self.false_r.name}'.")
             return await self.false_r.invoke_async(condition_output, context)
 
+    def _expand_to_graph(self, graph: 'WorkflowGraph', helper: '_GraphExportHelper') -> Tuple[List[str], List[str]]:
+        # 1. Expand Condition node (A)
+        entry_cond, exit_cond = self.condition_r._expand_to_graph(graph, helper)
+
+        # 2. Create AsyncCheckAdapter node
+        # Uses _AsyncCheckAdapterRunnable to support async checks (e.g. DB queries)
+        check_adapter = _AsyncCheckAdapterRunnable(self.condition_r)
+        adapter_node_name = helper.add_node(graph, check_adapter)
+
+        # Connect A -> Adapter
+        for parent in exit_cond:
+            helper.connect_by_name(graph, parent, adapter_node_name)
+
+        # 3. Create Router node
+        router = Router(name=f"{self.condition_r.name}_Router")
+        router_node_name = helper.add_node(graph, router)
+
+        # Connect Adapter -> Router
+        helper.connect_by_name(graph, adapter_node_name, router_node_name)
+
+        # 4. Expand True/False branches
+        entry_true, exit_true = self.true_r._expand_to_graph(graph, helper)
+        entry_false, exit_false = self.false_r._expand_to_graph(graph, helper)
+
+        # 5. Connect Router -> Branches (Control Flow)
+        for child in entry_true:
+            helper.connect_by_name(graph, router_node_name, child, branch="true")
+        for child in entry_false:
+            helper.connect_by_name(graph, router_node_name, child, branch="false")
+
+        # 6. Connect A -> Branches (Data Bypass)
+        for parent in exit_cond:
+            for child in entry_true:
+                helper.connect_by_name(graph, parent, child)
+            for child in entry_false:
+                helper.connect_by_name(graph, parent, child)
+
+        return entry_cond, exit_true + exit_false
 
 class AsyncWhile(AsyncRunnable):
     def __init__(self, condition_check_runnable: Runnable, body_runnable: Runnable, max_loops: int = 100, name: Optional[str] = None, **kwargs):

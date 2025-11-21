@@ -230,7 +230,7 @@ class WorkflowGraph:
             raise Exception(f"Failed to build execution stages, unvisited nodes: {missing}")
         return stages
 
-    def compile(self) -> 'CompiledGraph':
+    def compile(self, enable_gc: bool = True) -> 'CompiledGraph':
         if not self.nodes:
             raise ValueError(f"Graph '{self.name}' has no nodes, cannot compile.")
 
@@ -251,6 +251,19 @@ class WorkflowGraph:
             if not effective_output_nodes and self.nodes: 
                 effective_output_nodes = [sorted_node_names[-1]] if sorted_node_names else []
 
+        # Calculate Initial Reference Counts for GC
+        # ref_count[u] = (number of downstream nodes depending on u) + (1 if u is an output node)
+        ref_counts = {node: 0 for node in self.nodes}
+        
+        for u, neighbors in self._adj.items():
+            # Note: use set to de-duplicate. If A->B has multiple edges (mapping multiple fields),
+            # B still counts as only 1 consumer.
+            unique_consumers = set(neighbors)
+            ref_counts[u] += len(unique_consumers)
+            
+        for out_node in effective_output_nodes:
+            ref_counts[out_node] += 1
+
         return CompiledGraph(
             name=f"Compiled_{self.name}",
             nodes_map=self.nodes, 
@@ -260,7 +273,9 @@ class WorkflowGraph:
             output_node_names=effective_output_nodes,
             graph_definition_name=self.name,
             use_cache = self.use_cache,
-            execution_stages=self._get_execution_stages(sorted_node_names)
+            execution_stages=self._get_execution_stages(sorted_node_names),
+            initial_ref_counts=ref_counts,
+            enable_gc=enable_gc
         )
 
 
@@ -284,6 +299,8 @@ class CompiledGraph(Runnable):
                  output_node_names: List[str],
                  graph_definition_name: str,
                  execution_stages: Optional[List[List[str]]] = None,
+                 initial_ref_counts: Optional[Dict[str, int]] = None,
+                 enable_gc: bool = True,
                  **kwargs):
         super().__init__(name=name, **kwargs)
         self.nodes: Dict[str, Runnable] = nodes_map
@@ -293,6 +310,8 @@ class CompiledGraph(Runnable):
         self.output_nodes: List[str] = output_node_names
         self.graph_def_name: str = graph_definition_name
         self.execution_stages: List[List[str]] = execution_stages or [sorted_node_names]
+        self.initial_ref_counts: Dict[str, int] = initial_ref_counts or {}
+        self.enable_gc = enable_gc
 
         self._incoming_edges: Dict[str, List[EdgeDefinition]] = {n: [] for n in self.nodes}
         self._branch_edges: Dict[str, List[EdgeDefinition]] = {n: [] for n in self.nodes}
@@ -315,7 +334,7 @@ class CompiledGraph(Runnable):
         return result
 
     def _internal_invoke(self, input_data: Any, context: ExecutionContext) -> Any:
-        logger.info(f"CompiledGraph '{self.name}' (from '{self.graph_def_name}'): Starting SYNC execution.")
+        logger.info(f"CompiledGraph '{self.name}' (from '{self.graph_def_name}'): Starting SYNC execution. GC Enabled: {self.enable_gc}")
         internal_context = InMemoryExecutionContext(initial_input=input_data, parent_context=context)
         internal_context.log_event(f"Graph '{self.name}': SYNC internal context created. Initial input type: {type(input_data).__name__}")
         self._execute_sync(input_data, internal_context)
@@ -324,7 +343,7 @@ class CompiledGraph(Runnable):
         return self._collect_final_results(internal_context)
 
     async def _internal_invoke_async(self, input_data: Any, context: ExecutionContext) -> Any:
-        logger.info(f"CompiledGraph '{self.name}' (from '{self.graph_def_name}'): Starting ASYNC execution.")
+        logger.info(f"CompiledGraph '{self.name}' (from '{self.graph_def_name}'): Starting ASYNC execution. GC Enabled: {self.enable_gc}")
         internal_context = InMemoryExecutionContext(initial_input=input_data, parent_context=context)
         internal_context.log_event(f"Graph '{self.name}': ASYNC internal context created. Initial input type: {type(input_data).__name__}")
         await self._execute_async(input_data, internal_context)
@@ -334,6 +353,9 @@ class CompiledGraph(Runnable):
 
     def _execute_sync(self, graph_input: Any, internal_context: ExecutionContext) -> None:
         state = self._build_initial_state(graph_input)
+        # Add runtime reference counts to state for GC
+        state["runtime_ref_counts"] = self.initial_ref_counts.copy()
+        
         queue = state["queue"]
         while queue:
             node = queue.popleft()
@@ -348,11 +370,18 @@ class CompiledGraph(Runnable):
                 raise
             state["node_states"][node] = "completed"
             internal_context.add_output(node, result)
+            
+            # Trigger GC for inputs of this node (since it has finished consuming them)
+            self._perform_garbage_collection(node, state, internal_context)
+
             result_plain = Runnable._model_to_plain(result)
             self._propagate_output(node, result_plain, state, queue, internal_context)
 
     async def _execute_async(self, graph_input: Any, internal_context: ExecutionContext) -> None:
         state = self._build_initial_state(graph_input)
+        # Add runtime reference counts to state for GC
+        state["runtime_ref_counts"] = self.initial_ref_counts.copy()
+
         queue = state["queue"]
         while queue:
             node = queue.popleft()
@@ -367,8 +396,44 @@ class CompiledGraph(Runnable):
                 raise
             state["node_states"][node] = "completed"
             internal_context.add_output(node, result)
+            
+            # Trigger GC for inputs of this node
+            self._perform_garbage_collection(node, state, internal_context)
+
             result_plain = Runnable._model_to_plain(result)
             self._propagate_output(node, result_plain, state, queue, internal_context)
+
+    def _perform_garbage_collection(self, 
+                                    finished_node: str, 
+                                    state: Dict[str, Any], 
+                                    context: ExecutionContext) -> None:
+        """
+        Garbage Collection Logic:
+        When 'finished_node' completes (or is skipped), it has consumed its inputs.
+        We decrement the reference count of all its upstream dependencies (parents).
+        If a parent's ref count drops to 0 and GC is enabled, we remove its output from context.
+        """
+        if not self.enable_gc:
+            return
+
+        runtime_ref_counts = state.get("runtime_ref_counts")
+        if not runtime_ref_counts:
+            return
+
+        # Identify unique parents of this node
+        incoming_edges = self._incoming_edges.get(finished_node, [])
+        unique_parents = set()
+        for edge in incoming_edges:
+            if edge.source != "__static__":
+                unique_parents.add(edge.source)
+        
+        for parent in unique_parents:
+            if parent in runtime_ref_counts:
+                runtime_ref_counts[parent] -= 1
+                if runtime_ref_counts[parent] <= 0:
+                    context.remove_output(parent)
+                    # Optional debug log:
+                    # logger.debug(f"GC: Node '{parent}' output removed (all consumers finished).")
 
     def _build_initial_state(self, graph_input: Any) -> Dict[str, Any]:
         queue = deque()
@@ -465,6 +530,11 @@ class CompiledGraph(Runnable):
             return
         state["node_states"][node] = "skipped"
         internal_context.notify_status(node, "skipped", {})
+        
+        # If a node is skipped, it is "finished" in terms of dependency consumption.
+        # Its parents are no longer needed by it.
+        self._perform_garbage_collection(node, state, internal_context)
+
         for edge in self.edges.get(node, []):
             if edge.source == "__static__":
                 continue

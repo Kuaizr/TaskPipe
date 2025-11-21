@@ -1,5 +1,13 @@
 """
 Example: WorkflowGraph with async parallel stages and explicit data mappings.
+
+This example demonstrates:
+1. WorkflowGraph for declarative workflow definition
+2. AsyncRunnable and async @task decorator
+3. Parallel execution of independent tasks
+4. Explicit data mappings between nodes
+5. Mixed sync/async tasks in the same workflow
+
 Run with: `python examples/parallel_report_workflow.py`
 """
 
@@ -86,11 +94,20 @@ class AnalyzeScreenshot(AsyncRunnable):
 
 @task
 def collect_context() -> ContextPayload:
+    """Synchronous task using @task decorator."""
     return ContextPayload(user="alex", ticket=42)
 
 
 @task
+async def collect_context_async() -> ContextPayload:
+    """Asynchronous task using @task decorator - automatically generates AsyncRunnable."""
+    await asyncio.sleep(0.1)  # Simulate async I/O
+    return ContextPayload(user="alex_async", ticket=42)
+
+
+@task
 def assemble_email(image_path: str, summary: str, ticket: int) -> EmailPayload:
+    """Assemble email from multiple inputs."""
     body = (
         f"Daily Report #{ticket}\n\n"
         f"- Summary: {summary}\n"
@@ -100,7 +117,15 @@ def assemble_email(image_path: str, summary: str, ticket: int) -> EmailPayload:
 
 
 @task
+async def send_email_async(email: EmailPayload) -> EmailStatus:
+    """Asynchronous email sending task."""
+    await asyncio.sleep(0.2)  # Simulate async email sending
+    return EmailStatus(status=f"EMAIL SENT (async)\n{email.body}")
+
+
+@task
 def send_email(email: EmailPayload) -> EmailStatus:
+    """Synchronous email sending task."""
     return EmailStatus(status=f"EMAIL SENT\n{email.body}")
 
 
@@ -131,6 +156,10 @@ def build_graph() -> WorkflowGraph:
 
 
 async def main() -> None:
+    print("=" * 60)
+    print("Example: Async Parallel Workflow with WorkflowGraph")
+    print("=" * 60)
+    
     graph = build_graph()
     compiled = graph.compile()
     ctx = InMemoryExecutionContext()
@@ -139,11 +168,27 @@ async def main() -> None:
     result = await compiled.invoke_async(NO_INPUT, ctx)
     duration = time.perf_counter() - start
 
-    print("Workflow result:\n", result)
-    print(f"Total duration: {duration:.2f}s (parallel stage should be ~= max task delay)")
+    print("\nWorkflow result:")
+    print(f"  Status: {result.status}")
+    print(f"  Total duration: {duration:.2f}s")
+    print(f"  Note: Parallel stage (CaptureScreenshot + AnalyzeScreenshot) should take ~= max task delay (~0.6s)")
 
-    print("\nRecent status events:")
+    print("\n" + "=" * 60)
+    print("Execution Stages (for parallel execution):")
+    print("=" * 60)
+    for i, stage in enumerate(compiled.execution_stages, 1):
+        print(f"  Stage {i}: {stage}")
+
+    print("\n" + "=" * 60)
+    print("Recent Status Events:")
+    print("=" * 60)
     for event in ctx.node_status_events[-8:]:
+        print("  ", event)
+    
+    print("\n" + "=" * 60)
+    print("Event Log (last 6 events):")
+    print("=" * 60)
+    for event in ctx.event_log[-6:]:
         print("  ", event)
 
 

@@ -607,12 +607,14 @@ class TestContextGC(unittest.TestCase):
 
         compiled2 = graph2.compile(enable_gc=True)
         ctx2 = InMemoryExecutionContext()
-        compiled2.invoke(NO_INPUT, ctx2)
+        result = compiled2.invoke(NO_INPUT, ctx2)
         
         # P 应该被 GC（因为只有 A 分支执行，且 A 是输出节点）
         # 但 P 是输出节点的上游，可能不会被 GC
         # 这个测试主要验证 GC 不会崩溃
-        self.assertIn("A", ctx2.node_outputs)
+        # 检查结果是否正确（A 分支应该执行，返回 101）
+        result_val = result.result if hasattr(result, 'result') else result
+        self.assertEqual(result_val, 101)  # 100 + 1
 
 if __name__ == "__main__":
     unittest.main()

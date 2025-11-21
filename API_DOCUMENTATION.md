@@ -80,11 +80,6 @@ classDiagram
     Runnable "0..1" --* ExecutionContext : uses >
     ExecutionContext "1" --o "0..1" ExecutionContext : parent_context >
 
-    class SimpleTask {
-        +func: Callable
-    }
-    Runnable <|-- SimpleTask
-
     class Pipeline {
         +first: Runnable
         +second: Runnable
@@ -250,6 +245,16 @@ classDiagram
 - `_input_bindings`: 通过 `map_inputs` 和静态常量构建的字段级依赖描述。
 - `Output`: 属性访问器，可通过 `some_task.Output.field_name` 在上游表达式中引用字段，配合 `map_inputs` 形成显式数据映射。
 
+**`@task` 装饰器**:
+
+`@task` 装饰器可以将普通函数（包括异步函数）转换为 `Runnable` 或 `AsyncRunnable` 实例。装饰器会自动从函数签名推断 `InputModel` 和 `OutputModel`：
+
+- **同步函数**: 装饰后生成同步 `Runnable` 子类，实现 `_internal_invoke` 方法。
+- **异步函数**: 装饰后生成 `AsyncRunnable` 子类，实现 `_internal_invoke_async` 方法。
+- **类型推断**: 从函数参数的类型提示自动生成 `InputModel`，从返回类型提示自动生成 `OutputModel`。
+- **Pydantic 模型支持**: 如果返回类型是 Pydantic `BaseModel`，直接使用该模型作为 `OutputModel`；如果返回类型是字典注解（如 `-> {"field": type}`），则生成对应的模型。
+- **单字段自动包装**: 如果函数返回原始值（如 `int`、`str`），会自动包装为单字段模型（如 `{"result": value}`）。
+
 **主要方法:**
 
 - `__init__(self, name: Optional[str] = None, cache_key_generator: Optional[Callable] = None, use_cache: bool = False, config: Optional[Dict[str, Any]] = None)`: 构造函数；当声明 `ConfigModel` 时会自动校验 `config`。
@@ -353,11 +358,11 @@ classDiagram
 
 #### 同步实现 (`taskpipe.runnables`)
 
-* **`SimpleTask(Runnable)`**: 将普通函数包装成同步 `Runnable`，自动推断 `InputModel`/`OutputModel`。
-  * `__init__(self, func: Callable, name: Optional[str] = None, **kwargs)`
+* **`@task` 装饰器**: 将普通函数（包括异步函数）包装成 `Runnable` 或 `AsyncRunnable`，自动从函数签名推断 `InputModel`/`OutputModel`。对于异步函数，会自动生成 `AsyncRunnable` 子类。
+  * 使用方式: `@task` 装饰器直接应用于函数定义，支持类型提示和 Pydantic 模型。
 * **`Pipeline(Runnable)`**: 按顺序同步执行两个 `Runnable`。
   * `__init__(self, first: Runnable, second: Runnable, name: Optional[str] = None, **kwargs)`
-* **`Conditional(Runnable)`**: 根据同步条件执行两个分支之一。
+* **`Conditional(Runnable)`**: 根据同步条件执行两个分支之一。在展开为图时会自动插入 `_CheckAdapterRunnable` 和 `Router` 节点，实现显式的条件判断和数据透传。
   * `__init__(self, condition_r: Runnable, true_r: Runnable, false_r: Runnable, name: Optional[str] = None, **kwargs)`
 * **`BranchAndFanIn(Runnable)`**: 将单个输入扇出到多个并行同步任务（使用 `ThreadPoolExecutor`），并聚合结果。
   * `__init__(self, tasks_dict: Dict[str, Runnable], name: Optional[str] = None, max_workers: Optional[int] = None, **kwargs)`
@@ -379,6 +384,7 @@ classDiagram
 * **`AsyncConditional(AsyncRunnable)`**:
   * 条件 `Runnable` (condition\_r) 通过 `await condition_r.check_async(...)` 进行检查。
   * 根据结果，对真分支或假分支的 `Runnable` (true\_r 或 false\_r) 调用 `await branch.invoke_async(...)`。
+  * 在展开为图时会自动插入 `_AsyncCheckAdapterRunnable` 和 `Router` 节点，实现显式的条件判断和数据透传。
 * **`AsyncBranchAndFanIn(AsyncRunnable)`**:
   * 将单个输入异步扇出到 `tasks_dict` 中的多个并行任务。
   * 对每个任务调用 `task.invoke_async(input, context)`，并使用 `asyncio.gather(*coros, return_exceptions=True)` 来并发执行和收集结果。
@@ -417,7 +423,7 @@ classDiagram
 * `add_edge(self, source_node_name: str, dest_node_name: str, data_mapping: Optional[Dict[str, str]] = None, static_inputs: Optional[Dict[str, Any]] = None, branch: Optional[str] = None)`: 添加一条从源节点到目标节点的边。`data_mapping` 描述字段拷贝关系，`static_inputs` 记录常量注入，`branch` 用于 Router 控制流。
 * `set_entry_point(self, node_name: str) -> 'WorkflowGraph'`: 设置图的一个入口节点。
 * `set_output_nodes(self, node_names: List[str]) -> 'WorkflowGraph'`: 设置图的输出节点列表。
-* `compile(self) -> 'CompiledGraph'`: 分析图结构（进行拓扑排序以检测循环并确定执行顺序），并返回一个可执行的 `CompiledGraph` 实例。
+* `compile(self, enable_gc: bool = False) -> 'CompiledGraph'`: 分析图结构（进行拓扑排序以检测循环并确定执行顺序），并返回一个可执行的 `CompiledGraph` 实例。`enable_gc` 参数控制是否启用内存垃圾回收（清理不再被下游节点使用的中间数据）。
 * `to_json(self) -> Dict[str, Any]`: 将当前图序列化，便于持久化或下发至低代码平台（暂不序列化复杂的 `input_mapper`）。
 * `@classmethod from_json(cls, json_data: Dict[str, Any], registry: Union[Dict[str, Union[Runnable, Callable[[], Runnable]]], RunnableRegistry]) -> WorkflowGraph`: 根据 JSON + 注册表重建工作流，可以传入 taskpipe 自带的 `RunnableRegistry`。
 
@@ -437,6 +443,7 @@ classDiagram
 * `entry_points: List[str]`: 图的实际入口点。
 * `output_nodes: List[str]`: 图的实际输出节点。
 * `graph_def_name: str`: 从中编译此图的 `WorkflowGraph` 的名称。
+* `enable_gc: bool`: 是否启用内存垃圾回收，清理不再被下游节点使用的中间数据。
 
 **执行**:
 
@@ -522,61 +529,62 @@ TaskPipe 主要设计用于编排具有明确定义的阶段、输入和输出�
 ```python
 import asyncio
 from taskpipe import (
-    ExecutionContext,
+    InMemoryExecutionContext,
     Runnable,
-    SimpleTask,
     AsyncRunnable,
-    AsyncPipeline, # 假设 __init__.py 中提升了
+    task,
     NO_INPUT
 )
 
 # 1. 定义任务 (可以是同步或异步)
 
-class MySyncTask(SimpleTask): # 继承自 SimpleTask 或直接 Runnable
-    def __init__(self, name=None, **kwargs):
-        # SimpleTask 通常需要一个 func，这里我们直接重写 _internal_invoke
-        super().__init__(func=lambda x: x, name=name or "MySyncTask", **kwargs)
+# 使用 @task 装饰器定义同步任务
+@task
+def my_sync_task(input_data: str) -> str:
+    if input_data is NO_INPUT:
+        processed_input = "default_sync_input"
+    else:
+        processed_input = input_data
+    result = f"sync_processed_{processed_input}"
+    print(f"MySyncTask: {processed_input} -> {result}")
+    return result
 
-    def _internal_invoke(self, input_data, context: ExecutionContext):
-        # 确保 input_data 不是 NO_INPUT
-        if input_data is NO_INPUT:
-            processed_input = "default_sync_input"
-        else:
-            processed_input = input_data
+# 使用 @task 装饰器定义异步任务（自动生成 AsyncRunnable）
+@task
+async def my_async_process(input_data: str) -> str:
+    if input_data is NO_INPUT:
+        processed_input = "default_async_input"
+    else:
+        processed_input = input_data
+    print(f"MyAsyncProcess: Starting async processing for {processed_input}...")
+    await asyncio.sleep(0.02) # 模拟异步I/O
+    result = f"async_finally_processed_{processed_input}"
+    print(f"MyAsyncProcess: ...finished async processing for {processed_input} -> {result}")
+    return result
 
-        result = f"sync_processed_{processed_input}"
-        print(f"Thread ID: {threading.get_ident()} - MySyncTask: {processed_input} -> {result}")
-        context.log_event(f"MySyncTask processed {processed_input}")
-        return result
-
+# 也可以使用传统继承方式定义异步任务
 class MyAsyncProcess(AsyncRunnable):
     async def _internal_invoke_async(self, input_data: Any, context: ExecutionContext) -> Any:
         if input_data is NO_INPUT:
             processed_input = "default_async_input"
         else:
             processed_input = input_data
-
-        print(f"Thread ID: {threading.get_ident()} - MyAsyncProcess: Starting async processing for {processed_input}...")
-        await asyncio.sleep(0.02) # 模拟异步I/O
+        print(f"MyAsyncProcess: Starting async processing for {processed_input}...")
+        await asyncio.sleep(0.02)
         result = f"async_finally_processed_{processed_input}"
-        print(f"Thread ID: {threading.get_ident()} - MyAsyncProcess: ...finished async processing for {processed_input} -> {result}")
-        context.log_event(f"MyAsyncProcess processed {processed_input}")
+        print(f"MyAsyncProcess: ...finished async processing for {processed_input} -> {result}")
         return result
 
-class MyFinalSyncTask(SimpleTask):
-    def __init__(self, name=None, **kwargs):
-        super().__init__(func=lambda x: x, name=name or "MyFinalSyncTask", **kwargs)
-
-    def _internal_invoke(self, input_data: Any, context: ExecutionContext) -> Any:
-        result = f"final_sync_touch_on_{input_data}"
-        print(f"Thread ID: {threading.get_ident()} - MyFinalSyncTask: {input_data} -> {result}")
-        context.log_event(f"MyFinalSyncTask processed {input_data}")
-        return result
+@task
+def my_final_sync_task(input_data: str) -> str:
+    result = f"final_sync_touch_on_{input_data}"
+    print(f"MyFinalSyncTask: {input_data} -> {result}")
+    return result
 
 # 2. 创建 Runnable 实例
-sync_task1 = MySyncTask(name="InitialSyncProcessing")
-async_task = MyAsyncProcess(name="MainAsyncWork")
-sync_task2 = MyFinalSyncTask(name="FinalSyncStep")
+sync_task1 = my_sync_task()
+async_task = my_async_process()  # 或 MyAsyncProcess(name="MainAsyncWork")
+sync_task2 = my_final_sync_task()
 
 # 3. 构建混合工作流: Sync | Async | Sync
 # 由于 async_task 是 AsyncRunnable，操作符重载会确保 workflow 是 AsyncPipeline
@@ -586,7 +594,7 @@ workflow = sync_task1 | async_task | sync_task2
 async def main():
     print(f"Workflow is of type: {type(workflow)}") # 应该是 AsyncPipeline
 
-    ctx = ExecutionContext()
+    ctx = InMemoryExecutionContext()
     initial_data = "start_data_001"
 
     print(f"\nExecuting workflow for '{initial_data}' using 'await workflow.invoke_async()':")
@@ -598,19 +606,8 @@ async def main():
     for event in ctx.event_log:
         print(event)
 
-    # 示例：从纯同步上下文调用 (需要确保 asyncio.run 不会嵌套)
-    # 如果 main() 是顶层入口，这里可以安全地演示同步调用
-    # 但如果在已运行的循环中，这将失败
-    print(f"\nSimulating execution for '{initial_data}_sync_run' using 'workflow.invoke()' (from a conceptual sync context):")
-    # 注意：以下调用会启动一个新的事件循环。不应在已运行的事件循环内执行。
-    # ctx_sync_run = ExecutionContext()
-    # final_result_sync_run = workflow.invoke(initial_data + "_sync_run", ctx_sync_run)
-    # print(f"Final Result from sync run: {final_result_sync_run}")
-
 
 if __name__ == "__main__":
-    # 为了在示例中获取线程ID，导入threading
-    import threading
     asyncio.run(main())
 
 ```

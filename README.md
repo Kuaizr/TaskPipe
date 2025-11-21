@@ -4,7 +4,7 @@ TaskPipe 是一个 Python 框架，用于构建、组合和执行复杂的工作
 
 ## 核心特性
 
-* **可组合的 `Runnable` 任务**: 将工作流的每一步定义为 `Runnable`/`AsyncRunnable`。可以用传统继承方式，也可以通过 `@task` 装饰器把普通函数“抬升”为带 Pydantic 校验的任务。常用组合器包括 `SimpleTask`、`Pipeline`、`Conditional`、`BranchAndFanIn`、`SourceParallel` 及其异步版本。
+* **可组合的 `Runnable` 任务**: 将工作流的每一步定义为 `Runnable`/`AsyncRunnable`。可以用传统继承方式，也可以通过 `@task` 装饰器把普通函数（包括异步函数）"抬升"为带 Pydantic 校验的任务。常用组合器包括 `Pipeline`、`Conditional`、`BranchAndFanIn`、`SourceParallel` 及其异步版本。
 * **显式数据映射 (`map_inputs`)**：
     * 所有 `Runnable` 都通过 `InputModel` / `OutputModel` 声明结构化 Schema。
     * `child.map_inputs(foo=parent.Output.bar, timeout=3)` 可以精准描述数据流以及常量注入，便于 GUI/JSON 序列化。
@@ -29,7 +29,8 @@ TaskPipe 是一个 Python 框架，用于构建、组合和执行复杂的工作
 * **生命周期钩子**:
     * 新增 `on_start` 和 `on_complete` 生命周期钩子，允许用户在任务执行的关键阶段（开始前和完成后）注入自定义逻辑。
     * 这些钩子（包括增强后的 `on_error`）都可以接受 `Runnable` 实例或普通可调用函数作为处理器，为日志记录、资源管理、监控和通知等场景提供了极大的灵活性。
-* **基于图的定义 (可选)**: `WorkflowGraph` 中的边保存 `data_mapping` / `static_inputs` / `branch`，`CompiledGraph` 在运行时根据这些配置精准拼装输入，并提供 Router 分支激活、跳过等控制流能力。
+* **基于图的定义 (可选)**: `WorkflowGraph` 中的边保存 `data_mapping` / `static_inputs` / `branch`，`CompiledGraph` 在运行时根据这些配置精准拼装输入，并提供 Router 分支激活、跳过等控制流能力。`Conditional` 节点在展开为图时会自动插入 `CheckAdapter` 和 `Router` 节点，实现显式的条件判断和数据透传。
+* **内存管理 (GC)**: `CompiledGraph` 支持 `enable_gc` 参数，可以在运行时清理不再被下游节点使用的中间数据，节省内存。
 * **RunnableRegistry**： taskpipe 内置轻量级注册表，应用层可以集中注册可用的 `Runnable`，`WorkflowGraph.from_json` 可以直接使用该注册表来反序列化节点。
 * **图 ↔ 代码 双向转换**: 任意 `Runnable`（例如通过 `|` 操作符构建的“PyTorch 风格”流水线）都可以调用 `.to_graph()` 导出为 `WorkflowGraph`，而 `WorkflowGraph.from_json()` / `WorkflowGraph.to_json()` 允许平台化场景进行持久化、可视化与低代码集成。示例脚本会将导出的 JSON 保存到 `examples/registry_workflow.json`，便于直接加载或上传。
 * **可扩展性**: 用户可以轻松创建自己的、继承自 `Runnable` 或 `AsyncRunnable` 的自定义任务类型，以封装特定的业务逻辑。
@@ -75,6 +76,7 @@ pip install -e .
 ```python
 from pydantic import BaseModel
 from taskpipe import Runnable, task
+import asyncio
 
 class EmailInput(BaseModel):
     subject: str
@@ -95,9 +97,16 @@ class SendEmail(Runnable):
         ...  # 实际发送邮件
         return {"status": "sent"}
 
+# @task 装饰器支持同步和异步函数
 @task
 def format_status(email: EmailOutput) -> {"text": str}:
     return {"text": f"STATUS: {email.status}"}
+
+# 异步函数会自动生成 AsyncRunnable 子类
+@task
+async def async_format_status(email: EmailOutput) -> {"text": str}:
+    await asyncio.sleep(0.01)  # 模拟异步操作
+    return {"text": f"ASYNC STATUS: {email.status}"}
 
 mailer = SendEmail(config={"smtp_server": "smtp.example.com"})
 result = mailer | format_status

@@ -83,7 +83,7 @@ class TestAsyncComposers(unittest.TestCase):
             return v + 10
 
         @task
-        async def agent_brain(v: int):
+        async def agent_brain(v: int) -> dict:
             # 模拟 Agent 思考
             if v < 20:
                 # 返回一个 Runnable 实例，AgentLoop 会执行它
@@ -97,13 +97,20 @@ class TestAsyncComposers(unittest.TestCase):
         
         # Start with 5 -> add(5)=15 -> Brain(15) -> add(15)=25 -> Brain(25) -> Done
         res = asyncio.run(agent.invoke_async({"v": 5}))
-        # AgentLoop 返回的是 Pydantic 模型
+        # AgentLoop 返回的是 Pydantic 模型，result 字段包含 generated 的返回值
         res_val = res.result if hasattr(res, 'result') else res
+        # res_val 可能是 {"result": {"final": 25}} 或 {"final": 25}
         if isinstance(res_val, dict):
-            self.assertEqual(res_val["final"], 25)
+            # 如果 res_val 是 {"result": {"final": 25}}，提取内层 dict
+            if "result" in res_val and isinstance(res_val["result"], dict):
+                final_val = res_val["result"].get("final")
+            else:
+                final_val = res_val.get("final")
+            self.assertEqual(final_val, 25)
         else:
-            # 如果是模型，尝试访问 final 字段
-            self.assertEqual(getattr(res_val, "final", None), 25)
+            # 如果是 Pydantic 模型，尝试访问 final 字段
+            final_val = getattr(res_val, "final", None)
+            self.assertEqual(final_val, 25)
 
 class TestAsyncErrorHandling(unittest.TestCase):
     def test_async_retry(self):

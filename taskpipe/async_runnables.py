@@ -19,7 +19,7 @@ from .runnables import (
     Router,
     _GraphExportHelper
 )
-from pydantic import BaseModel, create_model
+from pydantic import BaseModel, create_model, ValidationError
 
 logger = logging.getLogger(__name__)
 
@@ -107,7 +107,7 @@ class AsyncRunnable(Runnable):
                                 # 错误处理器的输出可能使用不同的模型，尝试应用输出模型，如果失败则直接使用
                                 try:
                                     adjusted_output = self._apply_output_model(error_handler_output)
-                                except (ValueError, ValidationError):
+                                except (ValueError, ValidationError) as ve:
                                     # 如果错误处理器的输出模型不匹配，直接使用原始输出
                                     effective_context.log_event(f"Node '{self.name}': Error handler output model mismatch, using raw output.")
                                     adjusted_output = error_handler_output
@@ -268,14 +268,32 @@ class AsyncPipeline(AsyncRunnable):
 
     async def _internal_invoke_async(self, input_data: Any, context: ExecutionContext) -> Any:
         context.log_event(f"Node '{self.name}': First task '{self.first.name}' starting.")
-        output_first = await self.first.invoke_async(input_data, context)
-        context.log_event(f"Node '{self.name}': First task '{self.first.name}' completed. Second task '{self.second.name}' starting.")
-        # Pipeline 中，second 应该接收 first 的输出
-        # 如果 second 有 map_inputs 配置，会通过 context 自动处理
-        # 否则，直接传递 output_first，让 second 的 _prepare_input_payload 处理
-        output_second = await self.second.invoke_async(output_first, context)
-        context.log_event(f"Node '{self.name}': Second task '{self.second.name}' completed.")
-        return output_second
+        try:
+            output_first = await self.first.invoke_async(input_data, context)
+            context.log_event(f"Node '{self.name}': First task '{self.first.name}' completed. Second task '{self.second.name}' starting.")
+            # Pipeline 中，second 应该接收 first 的输出
+            # 如果 second 有 map_inputs 配置，会通过 context 自动处理
+            # 否则，直接传递 output_first，让 second 的 _prepare_input_payload 处理
+            output_second = await self.second.invoke_async(output_first, context)
+            context.log_event(f"Node '{self.name}': Second task '{self.second.name}' completed.")
+            return output_second
+        except Exception as e:
+            # 如果 Pipeline 有 error_handler，调用它
+            if self._error_handler:
+                context.log_event(f"Node '{self.name}': Error in pipeline, invoking error handler.")
+                if isinstance(self._error_handler, Runnable):
+                    error_output = await self._error_handler.invoke_async(input_data, context)
+                    # 错误处理器的输出可能使用不同的模型，尝试应用输出模型，如果失败则直接使用
+                    try:
+                        return self._apply_output_model(error_output)
+                    except Exception as e:
+                        # 如果错误处理器的输出模型不匹配，直接使用原始输出
+                        from pydantic import ValidationError
+                        if isinstance(e, (ValueError, ValidationError)):
+                            context.log_event(f"Node '{self.name}': Error handler output model mismatch, using raw output.")
+                            return error_output
+                        raise
+            raise
 
     async def _default_check_async(self, data_from_invoke: Any) -> bool:
         # Delegate check to the second runnable in the pipeline
@@ -471,7 +489,16 @@ class AgentLoop(AsyncRunnable):
         while iteration < self.max_iterations:
             iteration += 1
             context.log_event(f"Node '{self.name}': Iteration {iteration}, invoking generator '{self.generator.name}'.")
-            generated = await self.generator.invoke_async(current_payload, context)
+            # 对于 AgentLoop，generator 可能返回 Runnable 实例，所以我们需要直接调用 _internal_invoke_async
+            # 而不是 invoke_async，以避免输出模型验证
+            generated_raw = await self.generator._internal_invoke_async(
+                self.generator._apply_input_model(
+                    self.generator._prepare_input_payload(current_payload, context)
+                ),
+                context
+            )
+            # 处理 generator 的输出，但不应用输出模型验证（因为可能返回 Runnable）
+            generated = self.generator._process_result(generated_raw) if hasattr(self.generator, '_process_result') else generated_raw
 
             if isinstance(generated, Runnable):
                 context.log_event(
@@ -481,6 +508,8 @@ class AgentLoop(AsyncRunnable):
                 continue
 
             context.log_event(f"Node '{self.name}': Generator returned terminal result. Loop completed.")
+            # generated 可能是 Pydantic 模型、dict 或其他类型
+            # 直接包装在 result 字段中
             return {"result": generated}
 
         raise RuntimeError(
@@ -503,10 +532,14 @@ class AsyncBranchAndFanIn(AsyncRunnable):
         super().__init__(base_name, **kwargs)
 
     def _ensure_uniform_input_model(self) -> Type[BaseModel]:
-        models = {task._input_model_cls for task in self.tasks_dict.values()}
-        if len(models) != 1:
+        # 比较模型的字段而不是模型类型，因为 @task 生成的模型名称可能不同
+        model_fields_list = []
+        for task in self.tasks_dict.values():
+            fields = set(getattr(task._input_model_cls, "model_fields", {}).keys())
+            model_fields_list.append(fields)
+        if len(set(tuple(sorted(fields)) for fields in model_fields_list)) != 1:
             raise ValueError("AsyncBranchAndFanIn 所有子任务必须共享相同的 InputModel。")
-        return next(iter(models))
+        return next(iter(self.tasks_dict.values()))._input_model_cls
 
     def _build_output_model(self, base_name: str) -> Type[BaseModel]:
         fields = {
@@ -569,10 +602,14 @@ class AsyncSourceParallel(AsyncRunnable):
         super().__init__(base_name, **kwargs)
 
     def _ensure_uniform_input_model(self) -> Type[BaseModel]:
-        models = {task._input_model_cls for task in self.tasks_dict.values()}
-        if len(models) != 1:
+        # 比较模型的字段而不是模型类型，因为 @task 生成的模型名称可能不同
+        model_fields_list = []
+        for task in self.tasks_dict.values():
+            fields = set(getattr(task._input_model_cls, "model_fields", {}).keys())
+            model_fields_list.append(fields)
+        if len(set(tuple(sorted(fields)) for fields in model_fields_list)) != 1:
             raise ValueError("AsyncSourceParallel 所有子任务必须共享相同的 InputModel。")
-        return next(iter(models))
+        return next(iter(self.tasks_dict.values()))._input_model_cls
 
     def _build_output_model(self, base_name: str) -> Type[BaseModel]:
         fields = {

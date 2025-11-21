@@ -354,15 +354,17 @@ class TestComposersSync(unittest.TestCase):
         ctx.add_output("source_b", "hello")
         
         # 使用 map_inputs 配置映射
+        source_a = task(lambda: 10, name="SourceA")()
+        source_b = task(lambda: "hello", name="SourceB")()
         merge_task = merge_task.map_inputs(
-            a=task(lambda: 10)().Output.result,
-            b=task(lambda: "hello")().Output.result,
+            a=source_a.Output.result,
+            b=source_b.Output.result,
             c=3.14
         )
         
         # 手动设置上下文
-        task(lambda: 10)().invoke(NO_INPUT, ctx)
-        task(lambda: "hello")().invoke(NO_INPUT, ctx)
+        source_a.invoke(NO_INPUT, ctx)
+        source_b.invoke(NO_INPUT, ctx)
         
         result = merge_task.invoke(NO_INPUT, ctx)
         # MergeInputs 返回的可能是字符串或 Pydantic 模型

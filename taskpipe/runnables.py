@@ -821,10 +821,24 @@ def task(func: Optional[Callable] = None, *, name: Optional[str] = None):
                 return payload
 
             def _process_result(self, result: Any) -> Any:
-                """辅助方法：处理返回值"""
+                """辅助方法：处理返回值（不进行模型验证）"""
+                # 如果 result 是 Runnable 实例，直接返回（用于 AgentLoop 等场景）
+                if isinstance(result, Runnable):
+                    return result
                 if isinstance(result, BaseModel):
                     return result
+                # 如果 result 是 dict，检查 OutputModel 的字段
                 if isinstance(result, dict):
+                    output_fields = list(getattr(self.OutputModel, "model_fields", {}).keys())
+                    # 如果 OutputModel 只有一个字段且是 result，且 dict 的键不匹配，包装它
+                    if len(output_fields) == 1 and output_fields[0] == "result" and "result" not in result:
+                        return {"result": result}
+                    # 如果 dict 的键匹配 OutputModel 的字段，直接返回
+                    if set(result.keys()) == set(output_fields):
+                        return result
+                    # 否则，如果只有一个字段，包装它
+                    if len(output_fields) == 1:
+                        return {output_fields[0]: result}
                     return result
                 output_fields = list(getattr(self.OutputModel, "model_fields", {}).keys())
                 if len(output_fields) == 1:
@@ -1012,10 +1026,14 @@ class BranchAndFanIn(Runnable):
         super().__init__(name or f"BranchFanIn_{branch_names}", **kwargs)
 
     def _ensure_uniform_input_model(self) -> Type[BaseModel]:
-        models = {task._input_model_cls for task in self.tasks_dict.values()}
-        if len(models) != 1:
+        # 比较模型的字段而不是模型类型，因为 @task 生成的模型名称可能不同
+        model_fields_list = []
+        for task in self.tasks_dict.values():
+            fields = set(getattr(task._input_model_cls, "model_fields", {}).keys())
+            model_fields_list.append(fields)
+        if len(set(tuple(sorted(fields)) for fields in model_fields_list)) != 1:
             raise ValueError("BranchAndFanIn 所有子任务必须共享相同的 InputModel。")
-        return next(iter(models))
+        return next(iter(self.tasks_dict.values()))._input_model_cls
 
     def _build_output_model(self, base_name: str) -> Type[BaseModel]:
         fields = {
@@ -1072,10 +1090,14 @@ class SourceParallel(Runnable):
         super().__init__(name or f"SourceParallel_{branch_names}", **kwargs)
 
     def _ensure_uniform_input_model(self) -> Type[BaseModel]:
-        models = {task._input_model_cls for task in self.tasks_dict.values()}
-        if len(models) != 1:
+        # 比较模型的字段而不是模型类型，因为 @task 生成的模型名称可能不同
+        model_fields_list = []
+        for task in self.tasks_dict.values():
+            fields = set(getattr(task._input_model_cls, "model_fields", {}).keys())
+            model_fields_list.append(fields)
+        if len(set(tuple(sorted(fields)) for fields in model_fields_list)) != 1:
             raise ValueError("SourceParallel 所有子任务必须共享相同的 InputModel。")
-        return next(iter(models))
+        return next(iter(self.tasks_dict.values()))._input_model_cls
 
     def _build_output_model(self, base_name: str) -> Type[BaseModel]:
         fields = {
@@ -1192,11 +1214,33 @@ class MergeInputs(Runnable):
         task_name = name or f"MergeInputs_{getattr(merge_function, '__name__', 'custom')}"
         self.merge_function = merge_function
         self._legacy_input_sources = input_sources or {}
-        self.InputModel = _build_input_model_from_callable(merge_function, task_name)
-        self.OutputModel = _build_output_model_from_callable(merge_function, task_name)
+        # 如果 merge_function 是一个 Runnable 类（由 @task 装饰生成），提取原始函数
+        # 检查是否是类且是 Runnable 的子类
+        is_runnable_class = False
+        if inspect.isclass(merge_function):
+            try:
+                is_runnable_class = issubclass(merge_function, Runnable)
+            except TypeError:
+                pass
+        if is_runnable_class:
+            # 这是一个 @task 装饰的类，我们需要从它的 _internal_invoke 中提取信息
+            # 但为了简化，我们直接使用它的 InputModel 和 OutputModel
+            # 注意：@task 装饰的类在定义时还没有实例，所以我们需要创建一个临时实例来获取模型
+            temp_instance = merge_function()
+            self.InputModel = temp_instance._input_model_cls
+            self.OutputModel = temp_instance._output_model_cls
+            # 创建一个实例用于调用
+            self._merge_runnable = merge_function()
+        else:
+            self.InputModel = _build_input_model_from_callable(merge_function, task_name)
+            self.OutputModel = _build_output_model_from_callable(merge_function, task_name)
+            self._merge_runnable = None
         super().__init__(task_name, **kwargs)
 
     def _internal_invoke(self, input_data: Any, context: ExecutionContext) -> Any:
+        if self._merge_runnable:
+            # 如果 merge_function 是一个 Runnable，直接调用它
+            return self._merge_runnable.invoke(input_data, context)
         payload = input_data.model_dump() if isinstance(input_data, BaseModel) else dict(input_data or {})
         context.log_event(f"Node '{self.name}': Calling merge_function '{getattr(self.merge_function, '__name__', 'custom')}'.")
         return self.merge_function(**payload)

@@ -460,6 +460,23 @@ class Runnable(abc.ABC):
         try:
             if isinstance(result, output_model_cls):
                 return result
+            
+            # 如果 result 是 BaseModel 实例，检查是否是 output_model_cls 的基类或字段兼容
+            if isinstance(result, BaseModel):
+                result_type = type(result)
+                # 检查 result 是否是 output_model_cls 的基类（继承关系）
+                if issubclass(output_model_cls, result_type):
+                    # OutputModel 继承自 result 的类型，字段应该兼容，直接返回
+                    return result
+                # 检查字段是否兼容
+                result_fields = set(getattr(result_type, "model_fields", {}).keys())
+                expected_fields = set(getattr(output_model_cls, "model_fields", {}).keys())
+                if result_fields == expected_fields:
+                    # 字段兼容，直接返回
+                    return result
+                # 尝试通过 model_validate 转换
+                return output_model_cls.model_validate(result)
+            
             if isinstance(result, dict):
                 return output_model_cls(**result)
             return output_model_cls.model_validate(result)

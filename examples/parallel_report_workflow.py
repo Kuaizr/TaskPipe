@@ -126,7 +126,12 @@ async def send_email_async(email: EmailPayload) -> EmailStatus:
 @task
 def send_email(email: EmailPayload) -> EmailStatus:
     """Synchronous email sending task."""
-    return EmailStatus(status=f"EMAIL SENT\n{email.body}")
+    # Handle both Pydantic model and dict input
+    if isinstance(email, dict):
+        body = email.get("body", "")
+    else:
+        body = email.body
+    return EmailStatus(status=f"EMAIL SENT\n{body}")
 
 
 def build_graph() -> WorkflowGraph:
@@ -148,7 +153,7 @@ def build_graph() -> WorkflowGraph:
     graph.add_edge("CollectContext", "AnalyzeScreenshot", data_mapping={"user": "user", "ticket": "ticket"})
     graph.add_edge("CaptureScreenshot", "AssembleEmail", data_mapping={"image_path": "path", "ticket": "ticket"})
     graph.add_edge("AnalyzeScreenshot", "AssembleEmail", data_mapping={"summary": "summary", "ticket": "ticket"})
-    graph.add_edge("AssembleEmail", "SendEmail", data_mapping={"email": "body"})
+    graph.add_edge("AssembleEmail", "SendEmail", data_mapping={"email": "*"})
 
     graph.set_entry_point("CollectContext")
     graph.set_output_nodes(["SendEmail"])
@@ -169,7 +174,8 @@ async def main() -> None:
     duration = time.perf_counter() - start
 
     print("\nWorkflow result:")
-    print(f"  Status: {result.status}")
+    result_status = result.status if hasattr(result, 'status') else result
+    print(f"  Status: {result_status}")
     print(f"  Total duration: {duration:.2f}s")
     print(f"  Note: Parallel stage (CaptureScreenshot + AnalyzeScreenshot) should take ~= max task delay (~0.6s)")
 

@@ -51,9 +51,10 @@ def unreliable_task(value: int) -> NumberOutput:
     return NumberOutput(result=value * 2)
 
 
-@task
 def error_handler(context, input_data, exception) -> StatusOutput:
     """Error handler that returns a status instead of raising."""
+    # Note: error_handler should be a plain function, not a @task decorated function
+    # The signature is: (context: ExecutionContext, input_data: Any, exception: Exception) -> Any
     return StatusOutput(
         status=f"Error handled: {type(exception).__name__}",
         attempts=1
@@ -175,9 +176,13 @@ def example_while_loop() -> None:
     print("=" * 60)
     
     @task
-    def check_condition(last: int) -> bool:
-        """Check if we should continue looping."""
-        return last < 10
+    def check_condition(last: int) -> NumberOutput:
+        """Check if we should continue looping. Returns the value for checking."""
+        return NumberOutput(result=last)
+    
+    # Set check function to determine if we should continue
+    check_task = check_condition()
+    check_task.set_check(lambda x: (x.result if hasattr(x, 'result') else x) < 10)
     
     @task
     def increment(last: int) -> NumberOutput:
@@ -186,7 +191,7 @@ def example_while_loop() -> None:
     
     # Create while loop: continue while condition is True
     loop = While(
-        condition_check_runnable=check_condition(),
+        condition_check_runnable=check_task,
         body_runnable=increment(),
         max_loops=20,
         name="IncrementLoop"
@@ -194,8 +199,16 @@ def example_while_loop() -> None:
     
     ctx = InMemoryExecutionContext()
     result = loop.invoke({"last": 0}, ctx)
-    print(f"Final value after loop: {result.result}")
-    print(f"Expected: 10 (incremented from 0 to 10)")
+    # While loop returns a model with 'history' field containing all loop iterations
+    if hasattr(result, 'history') and result.history:
+        # Get the last iteration result
+        last_result = result.history[-1]
+        final_value = last_result.result if hasattr(last_result, 'result') else last_result
+        print(f"Final value after loop: {final_value}")
+        print(f"Expected: 10 (incremented from 0 to 10)")
+        print(f"Total iterations: {len(result.history)}")
+    else:
+        print(f"Loop result: {result}")
 
 
 def example_branch_and_fan_in() -> None:
@@ -227,8 +240,21 @@ def example_branch_and_fan_in() -> None:
     results = branch_workflow.invoke({"value": 5}, ctx)
     
     print("Results from parallel branches:")
-    for branch, result in results.items():
-        print(f"  {branch}: {result.result}")
+    # BranchAndFanIn returns a Pydantic model with fields for each branch
+    if hasattr(type(results), 'model_fields'):
+        # It's a Pydantic model, access fields directly
+        for branch_name in ["branch_a", "branch_b", "branch_c"]:
+            if hasattr(results, branch_name):
+                branch_result = getattr(results, branch_name)
+                result_val = branch_result.result if hasattr(branch_result, 'result') else branch_result
+                print(f"  {branch_name}: {result_val}")
+    elif isinstance(results, dict):
+        # It's a dict
+        for branch, result in results.items():
+            result_val = result.result if hasattr(result, 'result') else result
+            print(f"  {branch}: {result_val}")
+    else:
+        print(f"  Unexpected result type: {type(results)}")
 
 
 def example_source_parallel() -> None:
@@ -260,8 +286,21 @@ def example_source_parallel() -> None:
     results = parallel_workflow.invoke({}, ctx)
     
     print("Results from independent parallel tasks:")
-    for task_name, result in results.items():
-        print(f"  {task_name}: {result.result}")
+    # SourceParallel returns a Pydantic model with fields for each task
+    if hasattr(type(results), 'model_fields'):
+        # It's a Pydantic model, access fields directly
+        for task_name in ["task_a", "task_b", "task_c"]:
+            if hasattr(results, task_name):
+                task_result = getattr(results, task_name)
+                result_val = task_result.result if hasattr(task_result, 'result') else task_result
+                print(f"  {task_name}: {result_val}")
+    elif isinstance(results, dict):
+        # It's a dict
+        for task_name, result in results.items():
+            result_val = result.result if hasattr(result, 'result') else result
+            print(f"  {task_name}: {result_val}")
+    else:
+        print(f"  Unexpected result type: {type(results)}")
 
 
 async def example_agent_loop() -> None:
@@ -343,7 +382,8 @@ def example_garbage_collection() -> None:
     ctx_gc = InMemoryExecutionContext()
     result_gc = compiled_with_gc.invoke({}, ctx_gc)
     
-    print(f"Result with GC enabled: {result_gc.result}")
+    result_gc_val = result_gc.result if hasattr(result_gc, 'result') else result_gc
+    print(f"Result with GC enabled: {result_gc_val}")
     print(f"Context outputs (should only have Final): {list(ctx_gc.node_outputs.keys())}")
     
     # Compile without GC
@@ -351,7 +391,8 @@ def example_garbage_collection() -> None:
     ctx_no_gc = InMemoryExecutionContext()
     result_no_gc = compiled_no_gc.invoke({}, ctx_no_gc)
     
-    print(f"\nResult without GC: {result_no_gc.result}")
+    result_no_gc_val = result_no_gc.result if hasattr(result_no_gc, 'result') else result_no_gc
+    print(f"\nResult without GC: {result_no_gc_val}")
     print(f"Context outputs (should have all nodes): {list(ctx_no_gc.node_outputs.keys())}")
 
 

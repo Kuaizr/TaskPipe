@@ -52,6 +52,11 @@ class ExecutionContext(Protocol):
 
     def log_event(self, message: str) -> None: ...
 
+    def notify_status(self, node_name: str, status: str, metadata: Optional[Dict[str, Any]] = None) -> None: ...
+    
+    # 新增：定义标准的监听注册接口
+    def register_status_callback(self, callback: Callable[[str, str, Dict[str, Any]], None]) -> None: ...
+
 
 class InMemoryExecutionContext:
     """
@@ -63,6 +68,7 @@ class InMemoryExecutionContext:
         self.event_log: List[str] = []
         self.parent_context: Optional[ExecutionContext] = parent_context
         self.node_status_events: List[Dict[str, Any]] = []
+        self._status_callbacks: List[Callable[[str, str, Dict[str, Any]], None]] = []
 
     def add_output(self, node_name: str, value: Any):
         if node_name:
@@ -91,7 +97,11 @@ class InMemoryExecutionContext:
         logger.debug(f"ContextEvent: {message}")
         self.event_log.append(full_message)
 
+    def register_status_callback(self, callback: Callable[[str, str, Dict[str, Any]], None]):
+        self._status_callbacks.append(callback)
+
     def notify_status(self, node_name: str, status: str, metadata: Optional[Dict[str, Any]] = None) -> None:
+        # 1. 保持原有的日志记录 (为了历史回溯)
         event_payload = {
             "node": node_name,
             "status": status,
@@ -99,6 +109,14 @@ class InMemoryExecutionContext:
             "timestamp": time.time()
         }
         self.node_status_events.append(event_payload)
+
+        # 2. 触发所有注册的回调 (为了实时反馈)
+        for cb in self._status_callbacks:
+            try:
+                cb(node_name, status, metadata or {})
+            except Exception:
+                logging.getLogger(__name__).warning(f"Status callback failed for node {node_name}", exc_info=True)
+
 
     def __repr__(self) -> str:
         return f"<InMemoryExecutionContext id={id(self)} initial_input={str(self.initial_input)[:60]}, node_outputs_keys={list(self.node_outputs.keys())}>"

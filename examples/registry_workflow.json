@@ -1,71 +1,55 @@
 {
-  "name": "MetricIngestion",
+  "name": "MetricFlow",
   "nodes": [
     {
-      "id": "CollectMetrics",
-      "name": "CollectMetrics",
-      "ref": "CollectMetrics",
-      "type": "collect_metrics",
-      "input_schema": {},
-      "output_schema": {
-        "cpu": "float",
-        "ram": "float"
-      }
+      "id": "Start",
+      "type": "START"
     },
     {
-      "id": "NormalizeMetrics",
-      "name": "NormalizeMetrics",
-      "ref": "NormalizeMetrics",
-      "type": "normalize_metrics",
-      "input_schema": {
-        "cpu": "float",
-        "ram": "float"
-      },
-      "output_schema": {
-        "cpu": "float",
-        "ram": "float"
-      }
+      "id": "Normalize",
+      "type": "TaskWrapper"
     },
     {
-      "id": "PersistResult",
-      "name": "PersistResult",
-      "ref": "PersistResult",
-      "type": "persist_result",
-      "input_schema": {
-        "cpu": "float",
-        "ram": "float"
-      },
-      "output_schema": {
-        "text": "str"
-      }
+      "id": "Persist",
+      "type": "TaskWrapper"
+    },
+    {
+      "id": "End",
+      "type": "END"
     }
   ],
   "edges": [
     {
-      "source": "CollectMetrics",
-      "dest": "NormalizeMetrics",
+      "source": "Start",
+      "dest": "Normalize",
       "data_mapping": {
         "cpu": "cpu",
         "ram": "ram"
       },
       "static_inputs": {},
-      "branch": null
+      "branch": null,
+      "edge_id": "Start->Normalize#0"
     },
     {
-      "source": "NormalizeMetrics",
-      "dest": "PersistResult",
+      "source": "Normalize",
+      "dest": "Persist",
       "data_mapping": {
         "cpu": "cpu",
         "ram": "ram"
       },
       "static_inputs": {},
-      "branch": null
+      "branch": null,
+      "edge_id": "Normalize->Persist#0"
+    },
+    {
+      "source": "Persist",
+      "dest": "End",
+      "data_mapping": {
+        "text": "text"
+      },
+      "static_inputs": {},
+      "branch": null,
+      "edge_id": "Persist->End#0"
     }
-  ],
-  "entry_points": [
-    "CollectMetrics"
-  ],
-  "output_nodes": [
-    "PersistResult"
   ]
 }

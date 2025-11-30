@@ -1,55 +1,55 @@
 import logging
 logger = logging.getLogger(__name__)
 logger.addHandler(logging.NullHandler())
-# 从 runnables 模块提升常用类
+
+# 从 runnables 模块导入保留的类和新类
 from .runnables import (
     ExecutionContext,
     InMemoryExecutionContext,
     Runnable,
     Pipeline,
-    Conditional,
     BranchAndFanIn,
     SourceParallel,
-    While,
-    MergeInputs,
-    Router,
     ScriptRunnable,
     task,
-    NO_INPUT
+    NO_INPUT,
+    # 新增的核心原语
+    START,
+    END,
+    Switch,
+    Loop,
+    Map,
+    WaitForInput,
+    SuspendExecution
 )
 
-# 从 async_runnables 模块提升常用类
+# 从 async_runnables 模块导入
 from .async_runnables import (
     AsyncRunnable,
     AsyncPipeline,
-    AsyncConditional,
-    AsyncWhile,
     AsyncBranchAndFanIn,
-    AsyncSourceParallel,
-    AgentLoop,
-    _AsyncPendingConditional
+    AsyncSourceParallel
 )
 
-# 从 graph 模块提升常用类
+# 从 graph 模块导入
 from .graph import (
     WorkflowGraph,
     CompiledGraph
 )
 from .registry import RunnableRegistry
 
-# 可以定义 __all__ 来控制 from taskpipe import * 的行为
+# 定义公开导出的内容
 __all__ = [
-    # Runnable base and ExecutionContext
+    # 基础组件
     'ExecutionContext', 'InMemoryExecutionContext', 'Runnable', 'NO_INPUT',
-    # Sync Runnables
-    'Pipeline', 'Conditional', 'BranchAndFanIn',
-    'SourceParallel', 'While', 'MergeInputs', 'Router', 'ScriptRunnable', 'task',
-    # AsyncRunnable base
-    'AsyncRunnable',
-    # Async Composers
-    'AsyncPipeline', 'AsyncConditional', 'AsyncBranchAndFanIn','_AsyncPendingConditional',
-    'AsyncSourceParallel', 'AsyncWhile', 'AgentLoop',
-    # Graph components
+    # 组合器与工具
+    'Pipeline', 'BranchAndFanIn', 'SourceParallel', 'ScriptRunnable', 'task',
+    # 新核心原语
+    'START', 'END', 'Switch', 'Loop', 'Map', 'WaitForInput', 'SuspendExecution',
+    # 异步组件
+    'AsyncRunnable', 'AsyncPipeline', 'AsyncBranchAndFanIn', 'AsyncSourceParallel',
+    # 图引擎
     'WorkflowGraph', 'CompiledGraph',
+    # 注册表
     'RunnableRegistry'
 ]

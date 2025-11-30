@@ -2,7 +2,7 @@ from setuptools import setup, find_packages
 
 setup(
     name="taskpipe",
-    version="0.6.1",
+    version="0.7.0",
     description="A Python task processing library",
     author="kuaizhirui",
     author_email="kuaizhirui@gmail.com",
